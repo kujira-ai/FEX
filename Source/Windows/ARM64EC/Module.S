@@ -81,10 +81,10 @@ ExitFunctionSuspendResumePoint:
   and x23, x23, #-0x4
   add x17, x17, x23 // Resolve entry thunk address.
 
-  mov x4, sp
-  tbz x4, #3, ret_sp_misaligned
-  ldr lr, [x4], #0x8 // Pop the return address into lr.
-  mov sp, x4
+  mov x23, sp
+  tbz x23, #3, ret_sp_misaligned
+  ldr lr, [x23], #0x8 // Pop the return address into lr.
+  mov sp, x23
 
 ret_sp_aligned:
   br x17
