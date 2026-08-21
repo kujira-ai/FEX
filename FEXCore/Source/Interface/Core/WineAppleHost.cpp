@@ -12,7 +12,7 @@ namespace FEX::WineApple {
 namespace {
 
 constexpr size_t kPage = 16384;
-constexpr uint64_t kMaxCache = 8;
+constexpr uint64_t kMaxCache = 16;
 
 struct CacheEnt {
   uint64_t Guest;
@@ -138,6 +138,20 @@ void EmitBrAbs(uint32_t* Out, size_t& N, unsigned Rd, uint64_t Abs) {
   Out[N++] = 0xD61F0000u | (Rd << 5);
 }
 
+bool GuestLooksX64(uint64_t Ep) {
+  if (Ep < 0x10000ull) {
+    return false;
+  }
+  const uint8_t B = *reinterpret_cast<const volatile uint8_t*>(Ep);
+  if (B == 0x90 || B == 0x66 || B == 0x48 || B == 0xe8 || B == 0xe9) {
+    return true;
+  }
+  if (B >= 0x40 && B <= 0x57) {
+    return true;
+  }
+  return false;
+}
+
 void EmitRipAddBr(uint32_t* Out, size_t& N, uint32_t Delta, uint64_t LoopTop) {
   Out[N++] = 0xF9400F8Au; // ldr x10, [x28, #24] RIP
   Out[N++] = 0x91000000u | (Delta << 10) | (10u << 5) | 10u;
@@ -183,7 +197,7 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     }
   }
 
-  uint8_t B0 = 0, B1 = 0, B2 = 0, B3 = 0, B4 = 0;
+  uint8_t B0 = 0, B1 = 0, B2 = 0, B3 = 0, B4 = 0, B5 = 0;
   {
     const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
     B0 = P[0];
@@ -191,9 +205,10 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     B2 = P[2];
     B3 = P[3];
     B4 = P[4];
+    B5 = P[5];
   }
 
-  uint32_t Words[24];
+  uint32_t Words[32];
   size_t N = 0;
   if (B0 == 0x90) {
     EmitRipAddBr(Words, N, 1, LoopTop);
@@ -249,6 +264,30 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     } else {
       Words[N++] = 0xAA1F03EBu;
       Words[N++] = 0xF900017Fu;
+    }
+  } else if (B0 == 0xFF && B1 == 0x25) {
+    // jmp qword [rip+disp32]: load IAT, RIP = *slot.
+    // x64 target (hostname CRT / .hexpthk) → LoopTop; ARM64EC → ExitFunctionEC.
+    const int32_t Disp = static_cast<int32_t>(static_cast<uint32_t>(B2) | (static_cast<uint32_t>(B3) << 8) |
+                                              (static_cast<uint32_t>(B4) << 16) | (static_cast<uint32_t>(B5) << 24));
+    const uint64_t Slot = GuestRIP + 6 + static_cast<uint64_t>(static_cast<int64_t>(Disp));
+    uint64_t Tgt = 0;
+    if (Slot >= 0x10000ull) {
+      Tgt = *reinterpret_cast<const volatile uint64_t*>(Slot);
+    }
+    const uint64_t ExitEC = Frame ? Frame->Pointers.ExitFunctionEC : 0;
+    const bool ToX64 = Tgt >= 0x10000ull && GuestLooksX64(Tgt) && LoopTop;
+    const bool ToEC = Tgt >= 0x10000ull && ExitEC && !ToX64;
+    if (ToX64 || ToEC) {
+      EmitMovAbs(Words, N, 10, Slot); // x10 = IAT slot
+      Words[N++] = 0xF9400149u;       // ldr x9, [x10]
+      Words[N++] = 0xF9000F89u;       // str x9, [x28, #24] RIP
+      if (ToX64) {
+        EmitBrAbs(Words, N, 10, LoopTop);
+      } else {
+        Words[N++] = 0x910002FFu; // mov sp, x23 (guest RSP)
+        EmitBrAbs(Words, N, 10, ExitEC);
+      }
     }
   }
 
