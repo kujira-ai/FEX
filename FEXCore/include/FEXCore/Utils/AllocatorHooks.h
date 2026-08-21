@@ -46,6 +46,14 @@ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
 FEX_DEFAULT_VISIBILITY void ClearHooks();
 
 #ifdef _WIN32
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+// Darwin host mmap — VirtualAlloc IAT → ntdll x64 thunks (c000001d before JIT).
+FEX_DEFAULT_VISIBILITY void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true);
+FEX_DEFAULT_VISIBILITY void* VirtualAlloc(size_t Size, bool Execute = false, bool Commit = true);
+FEX_DEFAULT_VISIBILITY void VirtualFree(void* Ptr, size_t Size);
+FEX_DEFAULT_VISIBILITY void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true);
+FEX_DEFAULT_VISIBILITY bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options);
+#else
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
@@ -99,6 +107,7 @@ inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
 
   return ::VirtualProtect(Ptr, Size, prot, nullptr) == 0;
 }
+#endif
 
 FEX_DEFAULT_VISIBILITY extern VirtualNamePtr VirtualName;
 FEX_DEFAULT_VISIBILITY extern VirtualTHPPtr VirtualTHPControl;
@@ -160,6 +169,22 @@ void free(void* ptr);
 size_t malloc_usable_size(void* ptr);
 void* aligned_alloc(size_t a, size_t s);
 void aligned_free(void* ptr);
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+// Context* stored in host-mmap slab header (PE globals may be RO on 16k pages).
+FEX_DEFAULT_VISIBILITY void SetWineAppleContext(void* Ptr);
+FEX_DEFAULT_VISIBILITY void* GetWineAppleContext();
+// x86 `ret` page for Module.S misaligned-SP path — never write PE globals (RO 16k).
+FEX_DEFAULT_VISIBILITY void* GetOrCreateX64ReturnInstr();
+// Universal ARM64 host stub (used as L1 HostCode / CompileBlock stand-in).
+FEX_DEFAULT_VISIBILITY void* GetOrCreateWineAppleHostRetStub();
+// Last-good TEB for BeginSimulation when Darwin wipes tpidr/x18 (slab [24]).
+FEX_DEFAULT_VISIBILITY void SetWineAppleLastGoodTeb(void* Teb);
+FEX_DEFAULT_VISIBILITY void* GetWineAppleLastGoodTeb();
+// CHPE CPU area pointer (slab [32]) — BeginSimulation without TEB.
+FEX_DEFAULT_VISIBILITY void SetWineAppleCpuArea(void* Area);
+FEX_DEFAULT_VISIBILITY void* GetWineAppleCpuArea();
+#endif
 
 FEX_DEFAULT_VISIBILITY extern void InitializeThread();
 

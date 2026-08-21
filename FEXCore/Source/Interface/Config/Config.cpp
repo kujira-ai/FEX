@@ -234,22 +234,39 @@ void MetaLayer::MergeConfigMap(const LayerOptions& Options) {
 }
 
 void Initialize() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Wine-on-macOS PE loader may not zero the BSS tail of .data when
+  // VirtualSize > SizeOfRawData (Meta/ConfigLayers live there and can hold
+  // adjacent .pdata file garbage, e.g. 0x38de6400000000). Never touch Meta or
+  // ConfigLayers on this path — Getters use compile-time defaults only.
+  Meta = nullptr;
+#else
   AddLayer(fextl::make_unique<MetaLayer>(FEXCore::Config::LayerType::LAYER_TOP));
   Meta = dynamic_cast<MetaLayer*>(ConfigLayers.begin()->second.get());
+#endif
 }
 
 void Shutdown() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  Meta = nullptr;
+#else
   ConfigLayers.clear();
   Meta = nullptr;
+#endif
 }
 
 void Load() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // ConfigLayers is untrusted BSS on wine-apple — skip.
+  return;
+#else
   for (auto CurrentLayer = LoadOrder.begin(); CurrentLayer != LoadOrder.end(); ++CurrentLayer) {
     auto it = ConfigLayers.find(*CurrentLayer);
     if (it != ConfigLayers.end()) {
       it->second->Load();
     }
   }
+#endif
 }
 
 fextl::string ExpandPath(const fextl::string& ContainerPrefix, const fextl::string& PathName) {
@@ -333,6 +350,10 @@ fextl::string FindContainerPrefix() {
 }
 
 void ReloadMetaLayer() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Meta is untrusted BSS — no-op. Getters already use compile-time defaults.
+  return;
+#else
   Meta->Load();
 
   const fextl::string ContainerPrefix {FindContainerPrefix()};
@@ -409,27 +430,64 @@ void ReloadMetaLayer() {
     // Single stepping also enforces single instruction size blocks
     Set(FEXCore::Config::ConfigOption::CONFIG_MAXINST, "1");
   }
+#endif
 }
 
 void AddLayer(fextl::unique_ptr<FEXCore::Config::Layer> _Layer) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)_Layer; // ConfigLayers may be unzeroed BSS — do not touch.
+#else
   ConfigLayers.emplace(_Layer->GetLayerType(), std::move(_Layer));
+#endif
 }
 
 bool Exists(ConfigOption Option) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)Option;
+  return false;
+#else
+  if (!Meta) {
+    return false;
+  }
   return Meta->OptionExists(Option);
+#endif
 }
 
 std::optional<StringArrayType*> All(ConfigOption Option) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)Option;
+  return std::nullopt;
+#else
+  if (!Meta) {
+    return std::nullopt;
+  }
   return Meta->All(Option);
+#endif
 }
 
 std::optional<fextl::string*> Get(ConfigOption Option) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)Option;
+  return std::nullopt;
+#else
+  if (!Meta) {
+    return std::nullopt;
+  }
   return Meta->Get(Option);
+#endif
 }
 
 template<typename T>
 std::optional<T> GetConv(ConfigOption Option) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)Option;
+  return std::nullopt; // compile-time defaults only (Meta is untrusted BSS)
+#else
+  if (!Meta) {
+    return std::nullopt; // defaults via GetIfExists
+  }
   return Meta->GetConv<T>(Option);
+#endif
 }
 
 template std::optional<bool> GetConv(ConfigOption Option);
@@ -439,41 +497,76 @@ template std::optional<uint32_t> GetConv(ConfigOption Option);
 template std::optional<uint64_t> GetConv(ConfigOption Option);
 
 void Set(ConfigOption Option, std::string_view Data) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)Option;
+  (void)Data;
+#else
   Meta->Set(Option, Data);
+#endif
 }
 
 void Erase(ConfigOption Option) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)Option;
+#else
   Meta->Erase(Option);
+#endif
 }
 
 template<typename T>
 T Value<T>::GetIfExists(FEXCore::Config::ConfigOption Option, T Default) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Never load Meta (may be PE BSS garbage). ARM64EC is always 64-bit guest.
+  if constexpr (std::is_same_v<T, bool>) {
+    if (Option == FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE) {
+      return true;
+    }
+  }
+  (void)Option;
+  return Default;
+#else
   auto Value = FEXCore::Config::GetConv<T>(Option);
   if (Value) {
     return *Value;
   }
 
   return Default;
+#endif
 }
 
 template<>
 fextl::string Value<fextl::string>::GetIfExists(FEXCore::Config::ConfigOption Option, fextl::string Default) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Do not construct from Default via libc memmove — ARM64EC #memmove is an
+  // exit-thunk into x64 and illegal before FEX ThreadInit/JIT is ready.
+  (void)Option;
+  (void)Default;
+  return fextl::string {};
+#else
   auto Value = FEXCore::Config::Get(Option);
   if (Value) {
     return **Value;
   } else {
     return Default;
   }
+#endif
 }
 
 template<>
 fextl::string Value<fextl::string>::GetIfExists(FEXCore::Config::ConfigOption Option, std::string_view Default) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Empty SSO only — no #memmove/#memset exit thunks during ProcessInit.
+  (void)Option;
+  (void)Default;
+  return fextl::string {};
+#else
   auto Value = FEXCore::Config::Get(Option);
   if (Value) {
     return **Value;
   } else {
     return fextl::string(Default);
   }
+#endif
 }
 
 template bool Value<bool>::GetIfExists(FEXCore::Config::ConfigOption Option, bool Default);

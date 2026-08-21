@@ -26,6 +26,8 @@
 
 #include <array>
 #include <bit>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 namespace FEXCore::CPU {
@@ -52,6 +54,85 @@ Dispatcher::~Dispatcher() {
 }
 
 void Dispatcher::EmitDispatcher() {
+// jul10bi: full EmitDispatcher (multi-branch ForwardLabel fixed in Emitter.h).
+// jul10bk: forced STUB_EMIT parity — same 0x178@kernelbase as full emit (not emit regress).
+// jul10bj: wine-apple EnterEC = store PC; ret (below). Stub path: -DFEX_WINE_APPLE_STUB_EMIT=1.
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE && defined(FEX_WINE_APPLE_STUB_EMIT)
+  // Ship fallback: hand EnterEC only. Enable with -DFEX_WINE_APPLE_STUB_EMIT=1 if full emit regresses.
+  DispatchPtr = GetCursorAddress<AsmDispatch>();
+  auto* Words = reinterpret_cast<volatile uint32_t*>(DispatchPtr);
+  size_t N = 0;
+  auto Emit = [&](uint32_t W) {
+    Words[N++] = W;
+  };
+
+  const size_t StubTop = N;
+  Emit(0xd503201fu);
+  Emit(0xd65f03c0u);
+
+  const size_t EnterFill = N;
+  Emit(0xd503201fu);
+  Emit(0xd65f03c0u);
+
+  const size_t EnterEC = N;
+  Emit(0xF9400000u | ((0x30u / 8u) << 10) | (17u << 5) | 28u);
+  {
+    const uint32_t RipOff = static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+    Emit(0xF9000000u | ((RipOff / 8u) << 10) | (28u << 5) | 9u);
+  }
+  Emit(0xd65f03c0u);
+
+  CursorIncrement(N * 4);
+  Start = reinterpret_cast<uint64_t>(DispatchPtr);
+  End = Start + N * 4;
+
+  {
+    uintptr_t P = Start & ~63ull;
+    const uintptr_t E = End;
+    for (; P < E; P += 64) {
+      __asm__ volatile("dc cvau, %0" ::"r"(P) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    P = Start & ~63ull;
+    for (; P < E; P += 64) {
+      __asm__ volatile("ic ivau, %0" ::"r"(P) : "memory");
+    }
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+  }
+
+  (void)FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(DispatchPtr), MAX_DISPATCHER_CODE_SIZE,
+                                           FEXCore::Allocator::ProtectOptions::Read | FEXCore::Allocator::ProtectOptions::Exec);
+
+  const uint64_t StubAddr = Start + StubTop * 4;
+  const uint64_t EnterFillAddr = Start + EnterFill * 4;
+  const uint64_t EnterECAddr = Start + EnterEC * 4;
+
+  AbsoluteLoopTopAddress = StubAddr;
+  AbsoluteLoopTopAddressFillSRA = StubAddr;
+  AbsoluteLoopTopAddressEnterEC = EnterECAddr;
+  AbsoluteLoopTopAddressEnterECFillSRA = EnterFillAddr;
+  ThreadStopHandlerAddress = StubAddr;
+  ThreadStopHandlerAddressSpillSRA = StubAddr;
+  ThreadPauseHandlerAddress = StubAddr;
+  ThreadPauseHandlerAddressSpillSRA = StubAddr;
+  ExitFunctionLinkerAddress = StubAddr;
+  SignalHandlerReturnAddress = StubAddr;
+  SignalHandlerReturnAddressRT = StubAddr;
+  GuestSignal_SIGILL = StubAddr;
+  GuestSignal_SIGTRAP = StubAddr;
+  GuestSignal_SIGSEGV = StubAddr;
+  PauseReturnInstruction = StubAddr;
+  LUDIVHandlerAddress = StubAddr;
+  LDIVHandlerAddress = StubAddr;
+  F64SinHandlerAddress = StubAddr;
+  F64CosHandlerAddress = StubAddr;
+  F64TanHandlerAddress = StubAddr;
+  F64F2XM1HandlerAddress = StubAddr;
+  F64ScaleHandlerAddress = StubAddr;
+  F64AtanHandlerAddress = StubAddr;
+  F64FYL2XHandlerAddress = StubAddr;
+  return;
+#endif
   // Don't modify TMP3 since it contains our RIP once the block doesn't exist
   auto RipReg = TMP3;
 #ifdef VIXL_DISASSEMBLER
@@ -99,12 +180,29 @@ void Dispatcher::EmitDispatcher() {
   (void)b(&LoopTop);
 
   AbsoluteLoopTopAddressEnterECFillSRA = GetCursorAddress<uint64_t>();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Gate lt: FillStaticRegs ldr [x18,#0x1788] wants CPUArea (not TEB via tpidr).
+  // x17 is CPUArea on FillSRA entry. x18 := x17 - 0x1788. Not mrs tpidr (ls/lq).
+  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, TEB_CPU_AREA_OFFSET);
+  sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r18, ARMEmitter::Reg::r17, TMP1);
+#endif
   ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Gate lv: named insn was FillStaticRegs ldr STATE,[Tmp,#0x30] (Tmp=InSimulation).
+  FillStaticRegs({.ECStateFromCpuArea = true});
+#else
   FillStaticRegs();
+#endif
 
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // G3t: x11=TMP2 leftover after FillSRA → cbnz took CSS SGR (FAR 0x2).
+  // Same 4B: CBNZ → B LoopTop. Do not skip CSS SGR (G3s hexpthk).
+  (void)b(&LoopTop);
+#else
   // Force a single instruction block if ENTRY_FILL_SRA_SINGLE_INST_REG is nonzero entering the JIT, used for inline SMC handling.
   (void)cbnz(ARMEmitter::Size::i32Bit, ENTRY_FILL_SRA_SINGLE_INST_REG, &CompileSingleStep);
+#endif
 
   // Enter JIT
   (void)b(&LoopTop);
@@ -114,6 +212,11 @@ void Dispatcher::EmitDispatcher() {
   ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
   str(EC_CALL_CHECKER_PC_REG, STATE_PTR(CpuStateFrame, State.rip));
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // jul10bj: full EmitDispatcher is live, but enter_jit must not stack-swap into LoopTop yet
+  // (CompileBlock/JIT incomplete). Ship EnterEC parity: store guest PC, return to host.
+  ret();
+#else
   // Swap stacks to the emulator stack
   ldr(TMP1, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_STACK_BASE_OFFSET);
   add(ARMEmitter::Size::i64Bit, StaticRegisters[X86State::REG_RSP], ARMEmitter::Reg::rsp, 0);
@@ -136,6 +239,7 @@ void Dispatcher::EmitDispatcher() {
 
   // Enter JIT
 #endif
+#endif
 
   // We want to ensure that we are 16 byte aligned at the top of this loop
   Align16B();
@@ -150,8 +254,19 @@ void Dispatcher::EmitDispatcher() {
   // Clobbers TMP1/2
   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
   ARMEmitter::ForwardLabel l_NotECCode;
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // G3u: x18=0 after FillSRA (lt fake-TEB clobbered). PEB from tpidr, not x18.
+  // Do not write x18. Do not drop lt. Not lu (that overwrote LoopTop only after 0x31).
+  mrs(ARMEmitter::Reg::r11, ARMEmitter::SystemRegister::TPIDR_EL0);
+  ldr(TMP1, TMP2, TEB_PEB_OFFSET);
+#else
   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
+#endif
   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // pure-x64: EcCodeBitMap often NULL — treat as all-x64 (enter CompileBlock), not native.
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NotECCode);
+#endif
 
   lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg, 15);
   and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, 0x1fffffffffff8);
@@ -175,6 +290,11 @@ void Dispatcher::EmitDispatcher() {
 
   ARMEmitter::ForwardLabel NoBlock;
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // wine-apple: LookupCache/L2 not built (InitializeCompiler is L1-only). Always
+  // miss → CompileBlock → HostRetStub (RX). Avoid null L2Pointer load after RX entry.
+  (void)b(&NoBlock);
+#else
   if (DisableL2Cache()) {
     (void)b(&NoBlock);
   } else {
@@ -236,6 +356,7 @@ void Dispatcher::EmitDispatcher() {
       }
     }
   }
+#endif
 
   {
     ThreadStopHandlerAddressSpillSRA = GetCursorAddress<uint64_t>();
@@ -311,7 +432,7 @@ void Dispatcher::EmitDispatcher() {
   {
     (void)Bind(&NoBlock);
 
-    EmitSignalGuardedRegion([&]() {
+    auto NoBlockBody = [&]() {
       SpillStaticRegs(TMP1);
 
       if (!TMP_ABIARGS) {
@@ -336,7 +457,14 @@ void Dispatcher::EmitDispatcher() {
       }
 
       FillStaticRegs();
-    });
+    };
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    // G3r: skip NoBlock SGR (G3o shape). Prove 0x330 != ldr [x18,#0x1788].
+    // ExitFn SGR stays. Fewer insns. Prefix copy required (G3o skip did not land).
+    NoBlockBody();
+#else
+    EmitSignalGuardedRegion(NoBlockBody);
+#endif
 
     // Jump to the compiled block
     br(TMP1);
@@ -597,6 +725,15 @@ void Dispatcher::EmitDispatcher() {
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
   End = GetCursorAddress<uint64_t>();
   ClearICache(reinterpret_cast<void*>(DispatchPtr), End - reinterpret_cast<uint64_t>(DispatchPtr));
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Gate lb: VirtualAlloc(Execute) is RW HostMmap (Darwin W^X). After emit, flip
+  // RX so FillSRA/LoopTop/CompileBlock entry is executable — la/lb1 faulted
+  // c0000005@HostMmap without this. HostRetStub pages already mprotect RX.
+  (void)FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(DispatchPtr), MAX_DISPATCHER_CODE_SIZE,
+                                           FEXCore::Allocator::ProtectOptions::Read | FEXCore::Allocator::ProtectOptions::Exec);
+  ClearICache(reinterpret_cast<void*>(DispatchPtr), End - reinterpret_cast<uint64_t>(DispatchPtr));
+#endif
 
   if (CTX->Config.BlockJITNaming()) {
     fextl::string Name = fextl::fmt::format("Dispatch_{}", FHU::Syscalls::gettid());

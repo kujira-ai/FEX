@@ -1,4 +1,7 @@
 add_library(CommonWindowsRuntime STATIC LoadConfig.S)
+if(CMAKE_HOST_APPLE)
+  target_compile_definitions(CommonWindowsRuntime PRIVATE FEX_ON_WINE_APPLE=1)
+endif()
 add_subdirectory(CRT)
 add_subdirectory(WinAPI)
 
@@ -17,3 +20,6 @@ add_library(CommonWindows STATIC
 
 target_link_libraries(CommonWindows FEXCore_Base)
 target_include_directories(CommonWindows PRIVATE "${CMAKE_SOURCE_DIR}/Source/Windows/include/")
+if(CMAKE_HOST_APPLE)
+  target_compile_definitions(CommonWindows PRIVATE FEX_ON_WINE_APPLE=1)
+endif()

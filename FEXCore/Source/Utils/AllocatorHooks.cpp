@@ -18,6 +18,16 @@
 #include <unistd.h>
 
 namespace FEXCore::Allocator {
+// Mirror header enum for this TU only (JemallocLibs cannot pull full AllocatorHooks.h/fmt).
+enum class ProtectOptions : uint32_t {
+  None = 0,
+  Read = (1U << 0),
+  Write = (1U << 1),
+  Exec = (1U << 2),
+};
+inline ProtectOptions operator|(ProtectOptions A, ProtectOptions B) {
+  return static_cast<ProtectOptions>(static_cast<uint32_t>(A) | static_cast<uint32_t>(B));
+}
 using mmap_hook_type = void* (*)(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
 using munmap_hook_type = int (*)(void* addr, size_t length);
 
@@ -43,6 +53,400 @@ static rpmalloc_config_t global_config {
   .unmap_on_finalize = 0,
 };
 
+#if defined(_WIN32)
+// Wine-on-macOS PE: VirtualAlloc IAT → ntdll thunks (illegal this early);
+// rpmalloc_initialize also faults. Use Darwin host mmap when FEX_ON_WINE_APPLE.
+namespace {
+constexpr size_t kWinSlabSize = 128ull << 20;
+// On FEX_ON_WINE_APPLE, slab header holds host-writable pointers (PE globals may be RO
+// on 16k pages; host mmap slab is always RW).
+// [0]=Context* [8]=X64ReturnInstr* [16]=HostRetStub* [24]=LastGoodTeb* [32]=CpuArea*
+constexpr size_t kWineAppleSlabHeader = 48;
+void* gWinSlab {};
+size_t gWinUsed {};
+
+#if FEX_ON_WINE_APPLE
+// PE BSS may not be zeroed; gWinSlab can hold file-bleed junk (e.g. 0x38….00000000).
+static bool PlausibleSlab(void* P) {
+  const auto U = reinterpret_cast<uintptr_t>(P);
+  if (U < 0x10000ull) {
+    return false;
+  }
+  if ((U & 0xFFFull) != 0) {
+    return false; // HostMmap is page-aligned
+  }
+  if ((U & 0xFFFFFFFFull) == 0) {
+    return false; // classic BSS junk: high non-zero, low zero
+  }
+  if (U >= 0x0001'0000'0000'0000ull) {
+    return false;
+  }
+  return true;
+}
+
+// Hand-rolled — never call #memset/#memcpy (ARM64EC exit-thunks to x64 before JIT).
+static void HostMemset(void* Dst, int Val, size_t N) {
+  auto* P = static_cast<unsigned char*>(Dst);
+  const auto B = static_cast<unsigned char>(Val);
+  for (size_t I = 0; I < N; ++I) {
+    P[I] = B;
+  }
+}
+static void HostMemcpy(void* Dst, const void* Src, size_t N) {
+  auto* D = static_cast<unsigned char*>(Dst);
+  const auto* S = static_cast<const unsigned char*>(Src);
+  for (size_t I = 0; I < N; ++I) {
+    D[I] = S[I];
+  }
+}
+
+// prot: Darwin PROT_* bits (1=R 2=W 4=X).
+// flags default: MAP_PRIVATE|MAP_ANON=0x1002; MAP_JIT=0x0800 for executable codegen.
+void* HostMmap(size_t Size, uint64_t Prot = 3, uint64_t Flags = 0x1002ull) {
+  void* Result {};
+  const uintptr_t Len = Size;
+  const uintptr_t ProtU = Prot;
+  const uintptr_t FlagsU = Flags;
+  // Darwin SVC clobbers x18 (TEB); save/restore.
+  uintptr_t SavedTeb {};
+  uintptr_t SavedX18 {};
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(SavedTeb) :: "memory");
+  __asm__ volatile("mov %0, x18" : "=r"(SavedX18));
+  __asm__ volatile("mov x16, #197\n\t"
+                   "mov x0, #0\n\t"
+                   "mov x1, %1\n\t"
+                   "mov x2, %2\n\t"
+                   "mov x3, %3\n\t"
+                   "mov x4, #-1\n\t"
+                   "mov x5, #0\n\t"
+                   "svc #0x80\n\t"
+                   "mov %0, x0"
+                   : "=r"(Result)
+                   : "r"(Len), "r"(ProtU), "r"(FlagsU)
+                   : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "x18", "memory", "cc");
+  // Prefer pre-SVC TEB; fall back to pre-SVC x18 if tpidr was already junk.
+  uintptr_t Restore = SavedTeb;
+  if (Restore < 0x10000ull || (Restore & 0xFull)) {
+    Restore = SavedX18;
+  }
+  if (Restore >= 0x10000ull && !(Restore & 0xFull)) {
+    __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
+  }
+  if (reinterpret_cast<intptr_t>(Result) < 0) {
+    return nullptr;
+  }
+  return Result;
+}
+
+void HostMunmap(void* Ptr, size_t Size) {
+  if (!Ptr || !Size) {
+    return;
+  }
+  uintptr_t SavedTeb {}, SavedX18 {};
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(SavedTeb) :: "memory");
+  __asm__ volatile("mov %0, x18" : "=r"(SavedX18));
+  register uint64_t x0 __asm__("x0") = reinterpret_cast<uint64_t>(Ptr);
+  register uint64_t x1 __asm__("x1") = Size;
+  register uint64_t x16 __asm__("x16") = 73; // SYS_munmap
+  __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x16) : "memory", "x18", "cc");
+  uintptr_t Restore = (SavedTeb >= 0x10000ull && !(SavedTeb & 0xFull)) ? SavedTeb : SavedX18;
+  if (Restore >= 0x10000ull && !(Restore & 0xFull)) {
+    __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
+  }
+}
+
+int HostMprotect(void* Ptr, size_t Size, uint64_t Prot) {
+  if (!Ptr || !Size) {
+    return -1;
+  }
+  uintptr_t SavedTeb {}, SavedX18 {};
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(SavedTeb) :: "memory");
+  __asm__ volatile("mov %0, x18" : "=r"(SavedX18));
+  register uint64_t x0 __asm__("x0") = reinterpret_cast<uint64_t>(Ptr);
+  register uint64_t x1 __asm__("x1") = Size;
+  register uint64_t x2 __asm__("x2") = Prot;
+  register uint64_t x16 __asm__("x16") = 74; // SYS_mprotect
+  __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18", "cc");
+  uintptr_t Restore = (SavedTeb >= 0x10000ull && !(SavedTeb & 0xFull)) ? SavedTeb : SavedX18;
+  if (Restore >= 0x10000ull && !(Restore & 0xFull)) {
+    __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
+  }
+  return static_cast<int>(x0);
+}
+#else
+void* HostMmap(size_t Size, uint64_t Prot = 3) {
+  (void)Prot;
+  return ::VirtualAlloc(nullptr, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+#endif
+
+void* WinBump(size_t Size, size_t Align = 16) {
+#if FEX_ON_WINE_APPLE
+  if (!PlausibleSlab(gWinSlab)) {
+    gWinSlab = nullptr;
+    gWinUsed = 0;
+  }
+#endif
+  if (!gWinSlab) {
+    gWinSlab = HostMmap(kWinSlabSize);
+#if FEX_ON_WINE_APPLE
+    gWinUsed = kWineAppleSlabHeader;
+    if (gWinSlab) {
+      // Clear header: CTX, X64Ret, HostRet, LastTeb, CpuArea (+pad)
+      auto* H = reinterpret_cast<void**>(gWinSlab);
+      for (int I = 0; I < 6; ++I) {
+        H[I] = nullptr;
+      }
+    }
+#else
+    gWinUsed = 0;
+#endif
+    if (!gWinSlab) {
+      return nullptr;
+    }
+  }
+  if (Align < 16) {
+    Align = 16;
+  }
+  size_t Pad = (Align - (gWinUsed % Align)) % Align;
+  if (gWinUsed + Pad + Size > kWinSlabSize) {
+    size_t Chunk = (Size + Align + 0xFFFF) & ~size_t(0xFFFF);
+    void* Extra = HostMmap(Chunk);
+    if (!Extra) {
+      return nullptr;
+    }
+    uintptr_t P = reinterpret_cast<uintptr_t>(Extra);
+    P = (P + Align - 1) & ~(Align - 1);
+    return reinterpret_cast<void*>(P);
+  }
+  void* Result = reinterpret_cast<char*>(gWinSlab) + gWinUsed + Pad;
+  gWinUsed += Pad + Size;
+  return Result;
+}
+} // namespace
+
+#if FEX_ON_WINE_APPLE
+// Exec-capable host maps for Dispatcher/JIT (no VirtualAlloc IAT).
+void* VirtualAlloc(void* Base, size_t Size, bool Execute, bool Commit) {
+  (void)Commit;
+  if (Base) {
+    return nullptr; // fixed-base not needed on wine-apple bring-up path
+  }
+  // Always RW first (EmitDispatcher / CodeBuffer writes). Darwin W^X: never
+  // leave Execute maps non-RX after emit — EmitDispatcher VirtualProtect RX
+  // (gate lb). HostRetStub uses HostMprotect RX after write. MAP_JIT not
+  // required for mprotect RX (HostRetStub proved).
+  (void)Execute;
+  return HostMmap(Size, 3ull /* PROT_READ|PROT_WRITE */, 0x1002ull);
+}
+void* VirtualAlloc(size_t Size, bool Execute, bool Commit) {
+  return VirtualAlloc(nullptr, Size, Execute, Commit);
+}
+void VirtualFree(void* Ptr, size_t Size) {
+  HostMunmap(Ptr, Size);
+}
+void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit) {
+  (void)Recommit;
+  // Best-effort: re-zero via hand loop if small; else leave committed.
+  if (Ptr && Size && Size <= (1ull << 20)) {
+    auto* B = static_cast<unsigned char*>(Ptr);
+    for (size_t I = 0; I < Size; ++I) {
+      B[I] = 0;
+    }
+  }
+}
+bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
+  uint64_t Prot = 0;
+  if (options == ProtectOptions::None) {
+    Prot = 0;
+  } else if (options == ProtectOptions::Read) {
+    Prot = 1;
+  } else if (options == (ProtectOptions::Read | ProtectOptions::Write)) {
+    Prot = 3;
+  } else if (options == (ProtectOptions::Read | ProtectOptions::Exec)) {
+    Prot = 5;
+  } else if (options == (ProtectOptions::Read | ProtectOptions::Write | ProtectOptions::Exec)) {
+    Prot = 7;
+  } else {
+    return false;
+  }
+  return HostMprotect(Ptr, Size, Prot) == 0;
+}
+#endif
+
+void* malloc(size_t size) {
+  return WinBump(size);
+}
+void* calloc(size_t n, size_t size) {
+  size_t N = n * size;
+  void* P = WinBump(N);
+  if (P) {
+#if FEX_ON_WINE_APPLE
+    auto* B = static_cast<unsigned char*>(P);
+    for (size_t I = 0; I < N; ++I) {
+      B[I] = 0;
+    }
+#else
+    memset(P, 0, N);
+#endif
+  }
+  return P;
+}
+void* memalign(size_t align, size_t s) {
+  return WinBump(s, align ? align : 16);
+}
+void* valloc(size_t size) {
+  return WinBump(size, 0x10000);
+}
+int posix_memalign(void** r, size_t a, size_t s) {
+  *r = WinBump(s, a ? a : 16);
+  return *r ? 0 : 12;
+}
+void* realloc(void* ptr, size_t size) {
+  void* P = WinBump(size);
+  if (P && ptr) {
+#if FEX_ON_WINE_APPLE
+    auto* D = static_cast<unsigned char*>(P);
+    const auto* S = static_cast<const unsigned char*>(ptr);
+    for (size_t I = 0; I < size; ++I) {
+      D[I] = S[I];
+    }
+#else
+    memcpy(P, ptr, size);
+#endif
+  }
+  return P;
+}
+void free(void* ptr) {
+  (void)ptr;
+}
+size_t malloc_usable_size(void* ptr) {
+  (void)ptr;
+  return 0;
+}
+void* aligned_alloc(size_t a, size_t s) {
+  return WinBump(s, a ? a : 16);
+}
+void aligned_free(void* ptr) {
+  (void)ptr;
+}
+
+#if FEX_ON_WINE_APPLE
+static void EnsureWineAppleSlab() {
+  if (!PlausibleSlab(gWinSlab)) {
+    (void)WinBump(0, 16); // establish slab via HostMmap
+  }
+}
+
+void SetWineAppleContext(void* Ptr) {
+  EnsureWineAppleSlab();
+  if (PlausibleSlab(gWinSlab)) {
+    *reinterpret_cast<void**>(gWinSlab) = Ptr;
+  }
+}
+void* GetWineAppleContext() {
+  if (!PlausibleSlab(gWinSlab)) {
+    return nullptr;
+  }
+  return *reinterpret_cast<void**>(gWinSlab);
+}
+
+void* GetOrCreateX64ReturnInstr() {
+  EnsureWineAppleSlab();
+  if (!PlausibleSlab(gWinSlab)) {
+    return nullptr;
+  }
+  auto* Slot = reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 8);
+  if (*Slot) {
+    return *Slot;
+  }
+  // x86 RET opcode — Module.S loads this as LR for misaligned SP EC exits.
+  constexpr size_t Pg = 16384;
+  void* Page = HostMmap(Pg, 3ull); // RW first
+  if (!Page) {
+    return nullptr;
+  }
+  *static_cast<volatile uint8_t*>(Page) = 0xc3;
+  (void)HostMprotect(Page, Pg, 5ull); // RX best-effort
+  *Slot = Page;
+  return Page;
+}
+
+void* GetOrCreateWineAppleHostRetStub() {
+  EnsureWineAppleSlab();
+  if (!PlausibleSlab(gWinSlab)) {
+    return nullptr;
+  }
+  auto* Slot = reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 16);
+  if (*Slot) {
+    return *Slot;
+  }
+  // G5b: RIP+=2 then FAR-0 store. Rn≠31 (str xzr,[xzr] is [sp] — G5). TMP x10/x11.
+  constexpr size_t Pg = 16384;
+  void* Page = HostMmap(Pg, 3ull);
+  if (!Page) {
+    return nullptr;
+  }
+  auto* W = static_cast<volatile uint32_t*>(Page);
+  // offsetof(CpuStateFrame, State.rip) = 24. x28=STATE. x10/x11 = ARM64EC TMP (not SRA).
+  W[0] = 0xF9400F8Au; // ldr x10, [x28, #24]
+  W[1] = 0x9100094Au; // add x10, x10, #2
+  W[2] = 0xF9000F8Au; // str x10, [x28, #24]
+  W[3] = 0xAA1F03EBu; // mov x11, xzr
+  W[4] = 0xF900017Fu; // str xzr, [x11]
+  constexpr size_t StubBytes = 20;
+
+  {
+    uintptr_t P = reinterpret_cast<uintptr_t>(Page) & ~63ull;
+    const uintptr_t E = reinterpret_cast<uintptr_t>(Page) + StubBytes;
+    for (; P < E; P += 64) {
+      __asm__ volatile("dc cvau, %0" ::"r"(P) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    P = reinterpret_cast<uintptr_t>(Page) & ~63ull;
+    for (; P < E; P += 64) {
+      __asm__ volatile("ic ivau, %0" ::"r"(P) : "memory");
+    }
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+  }
+  (void)HostMprotect(Page, Pg, 5ull); // RX
+  *Slot = Page;
+  return Page;
+}
+
+void SetWineAppleLastGoodTeb(void* Teb) {
+  EnsureWineAppleSlab();
+  if (!PlausibleSlab(gWinSlab)) {
+    return;
+  }
+  *reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 24) = Teb;
+}
+
+void* GetWineAppleLastGoodTeb() {
+  if (!PlausibleSlab(gWinSlab)) {
+    return nullptr;
+  }
+  return *reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 24);
+}
+
+void SetWineAppleCpuArea(void* Area) {
+  EnsureWineAppleSlab();
+  if (!PlausibleSlab(gWinSlab)) {
+    return;
+  }
+  *reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 32) = Area;
+}
+
+void* GetWineAppleCpuArea() {
+  if (!PlausibleSlab(gWinSlab)) {
+    return nullptr;
+  }
+  return *reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 32);
+}
+#endif
+
+void InitializeThread() {}
+#else
 void* malloc(size_t size) {
   return ::rpmalloc(size);
 }
@@ -80,6 +484,7 @@ void aligned_free(void* ptr) {
 void InitializeThread() {
   rpmalloc_thread_initialize();
 }
+#endif
 
 #ifndef _WIN32
 [[nodiscard]]

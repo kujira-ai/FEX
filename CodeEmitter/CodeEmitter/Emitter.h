@@ -549,7 +549,15 @@ struct ForwardLabel {
   // The first element is stored separately to avoid allocations for simple cases
   Reference FirstInst;
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // wine-apple: fextl::vector push_back during EmitDispatcher multi-branch fixup
+  // faults (InitCore c000001d). Fixed stack slots — L2 walk needs ≤3 extras.
+  static constexpr size_t kMaxExtraInsts = 8;
+  Reference ExtraInsts[kMaxExtraInsts] {};
+  size_t ExtraCount = 0;
+#else
   fextl::vector<Reference> Insts;
+#endif
 };
 
 /* This `BiDirectionalLabel` struct used for retaining a location for PC-Relative instructions.
@@ -565,7 +573,13 @@ static inline void AddLocationToLabel(ForwardLabel* Label, ForwardLabel::Referen
   if (Label->FirstInst.Location == nullptr) {
     Label->FirstInst = Location;
   } else {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    if (Label->ExtraCount < ForwardLabel::kMaxExtraInsts) {
+      Label->ExtraInsts[Label->ExtraCount++] = Location;
+    }
+#else
     Label->Insts.push_back(Location);
+#endif
   }
 }
 
@@ -798,9 +812,15 @@ public:
     if (Label->FirstInst.Location) {
       Bound &= Bind(&Label->FirstInst);
     }
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    for (size_t I = 0; I < Label->ExtraCount; ++I) {
+      Bound &= Bind(&Label->ExtraInsts[I]);
+    }
+#else
     for (auto& Inst : Label->Insts) {
       Bound &= Bind(&Inst);
     }
+#endif
 
     return Bound;
   }

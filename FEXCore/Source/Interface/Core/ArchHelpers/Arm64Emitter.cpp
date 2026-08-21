@@ -808,8 +808,23 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
 
 #ifdef ARCHITECTURE_arm64ec
   // Load STATE in from the CPU area as x28 is not callee saved in the ARM64EC ABI.
-  ldr(TmpReg.X(), ARMEmitter::Reg::r18, TEB_CPU_AREA_OFFSET);
-  ldr(STATE, TmpReg, CPU_AREA_EMULATOR_DATA_OFFSET);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  if (Options.ECStateFromCpuArea) {
+    // Gate lv: [x18,#0x1788] after lt is CPUArea+0 = InSimulation (1), not a
+    // CPUArea*. Next ldr STATE,[Tmp,#0x30] was addr 0x31 (lt1/lu1).
+    ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
+  } else
+#endif
+  {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    // G3v: x18=0 after FillSRA. CPUArea from tpidr, not x18. Do not write x18.
+    mrs(TmpReg2, ARMEmitter::SystemRegister::TPIDR_EL0);
+    ldr(TmpReg.X(), TmpReg2, TEB_CPU_AREA_OFFSET);
+#else
+    ldr(TmpReg.X(), ARMEmitter::Reg::r18, TEB_CPU_AREA_OFFSET);
+#endif
+    ldr(STATE, TmpReg, CPU_AREA_EMULATOR_DATA_OFFSET);
+  }
 #endif
 
   ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));

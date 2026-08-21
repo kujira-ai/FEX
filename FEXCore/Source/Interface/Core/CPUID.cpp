@@ -143,9 +143,14 @@ constexpr uint32_t FAMILY_IDENTIFIER = GenerateFamily(CPUFamily {
 
 #ifdef ARCHITECTURE_arm64
 uint64_t GetCycleCounterFrequency() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Safe default — MRS CNTFRQ from PE has been unreliable under Wine-on-macOS.
+  return 24000000ull;
+#else
   uint64_t Result {};
   __asm("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Result));
   return Result;
+#endif
 }
 
 uint32_t GetCPUID_TPIDRRO() {
@@ -155,12 +160,32 @@ uint32_t GetCPUID_TPIDRRO() {
 }
 
 void CPUIDEmu::SetupHostHybridFlag() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // fextl::vector::resize → libc #memset/#memmove exit-thunks (x64) before JIT.
+  // Leave PerCPUData empty; product-name leaves tolerate it. Single non-hybrid core.
+  Hybrid = false;
+  return;
+#endif
   FEX_CONFIG_OPT(HideHybrid, HIDEHYBRID);
   PerCPUData.resize(Cores);
 
+  // Wine-on-macOS may pass empty CPUMIDRs (no EL0 MIDR). Avoid OOB.
+  if (CTX->HostFeatures.CPUMIDRs.empty()) {
+    for (size_t i = 0; i < Cores; ++i) {
+      PerCPUData[i].ProductName = ProductNames::ARM_AppleSilicon;
+      PerCPUData[i].MIDR = 0x61000000u;
+    }
+    Hybrid = Cores > 1;
+    if (HideHybrid()) {
+      Hybrid = false;
+    }
+    return;
+  }
+
   uint64_t MIDR {};
   for (size_t i = 0; i < Cores; ++i) {
-    auto NewMIDR = CTX->HostFeatures.CPUMIDRs[i];
+    const size_t MidrIdx = i < CTX->HostFeatures.CPUMIDRs.size() ? i : CTX->HostFeatures.CPUMIDRs.size() - 1;
+    auto NewMIDR = CTX->HostFeatures.CPUMIDRs[MidrIdx];
     if (MIDR != 0 && MIDR != NewMIDR) {
       // CPU mismatch, claim hybrid
       Hybrid = true;
@@ -1341,14 +1366,45 @@ FEXCore::CPUID::XCRResults CPUIDEmu::XCRFunction_0h() const {
 
 CPUIDEmu::CPUIDEmu(const FEXCore::Context::ContextImpl* ctx)
   : CTX {ctx}
-  , SupportsCPUIndexInTPIDRRO {CTX->HostFeatures.SupportsCPUIndexInTPIDRRO}
+  // Do not touch CTX->HostFeatures in the initializer list (partially constructed
+  // ContextImpl / layout quirks on Wine-on-macOS). Set in the body instead.
+  , SupportsCPUIndexInTPIDRRO {false}
   , GetCPUID {GetCPUID_Syscall} {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  auto CpuLog = [](const char* Msg, size_t Len) {
+    uintptr_t SavedTeb {}, SavedX18 {};
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(SavedTeb) :: "memory");
+    __asm__ volatile("mov %0, x18" : "=r"(SavedX18));
+    register uint64_t x0 __asm__("x0") = 2;
+    register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+    register uint64_t x2 __asm__("x2") = Len;
+    register uint64_t x16 __asm__("x16") = 4;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+    uintptr_t Restore = (SavedTeb >= 0x10000ull && !(SavedTeb & 0xFull)) ? SavedTeb : SavedX18;
+    if (Restore >= 0x10000ull && !(Restore & 0xFull)) {
+      __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
+    }
+  };
+  CpuLog("CPUIDEmu: enter\n", 14);
+#endif
+  SupportsCPUIndexInTPIDRRO = CTX->HostFeatures.SupportsCPUIndexInTPIDRRO;
   Cores = CTX->HostFeatures.CPUMIDRs.size();
+  // Wine-on-macOS may pass empty CPUMIDRs; Cores==0 underflows (Cores-1) and
+  // leaves PerCPUData empty → CreateNewContext faults.
+  if (Cores == 0) {
+    Cores = 1;
+  }
 
   // Setup some state tracking
   SetupHostHybridFlag();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  CpuLog("CPUIDEmu: after hybrid\n", 22);
+#endif
 
   SetupFeatures();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  CpuLog("CPUIDEmu: done\n", 15);
+#endif
 
 #ifdef ARCHITECTURE_arm64
   if (SupportsCPUIndexInTPIDRRO) {

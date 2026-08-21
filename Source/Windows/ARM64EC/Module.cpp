@@ -59,6 +59,7 @@ $end_info$
 #include <winternl.h>
 #include <winnt.h>
 #include <wine/debug.h>
+#include <rpmalloc/rpmalloc.h>
 
 namespace Exception {
 class ECSyscallHandler;
@@ -74,6 +75,9 @@ extern void* ExitFunctionSuspendResumePoint;
 
 void* X64ReturnInstr; // See Module.S
 uintptr_t NtDllBase;
+#if FEX_ON_WINE_APPLE
+void* WineFallbackCheckCall;
+#endif
 
 // Exports on ARM64EC point to x64 fast forward sequences to allow for redirecting to the JIT if functions are hotpatched. This LUT is from their addresses to the relative addresses of the native code exports.
 uint32_t* NtDllRedirectionLUT;
@@ -84,21 +88,254 @@ void* WineSyscallDispatcher;
 uint64_t WineNtContinueSyscallId;
 uint64_t WineNtAllocateVirtualMemorySyscallId;
 uint64_t WineNtProtectVirtualMemorySyscallId;
+uint64_t WineNtFreeVirtualMemorySyscallId;
 
 NTSTATUS NtContinueNative(ARM64_NT_CONTEXT* NativeContext, BOOLEAN Alert);
 NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
 NTSTATUS NtProtectVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG*);
+NTSTATUS NtFreeVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG);
 
 [[noreturn]]
 void JumpSetStack(uintptr_t PC, uintptr_t SP);
 }
+
+#if FEX_ON_WINE_APPLE
+using WineGetCurrentTeb_t = void* (*)();
+static WineGetCurrentTeb_t FEXWineGetCurrentTeb {};
+
+static bool FEXIsPlausibleWineTeb(uintptr_t Teb) {
+  // Reject Darwin SVC residue (e.g. MAP flags 0x1002) and null/low junk.
+  if (Teb < 0x100000000ULL) {
+    return false;
+  }
+  // Wine-on-macOS TEBs observed ~0x7fffffd0000 (below the old 0x7fffff000000 floor).
+  // Accept normal 64-bit user VAs; exclude kernel canonical high half.
+  if (Teb >= 0x800000000000ULL) {
+    return false;
+  }
+  // Prefer page-aligned (TEB is on a page); still allow if slightly off.
+  return true;
+}
+
+static void FEXSetLastGoodTeb(uintptr_t Teb) {
+  if (!FEXIsPlausibleWineTeb(Teb)) {
+    return;
+  }
+  // Host-mmap slab [24] — never PE .data (RO risk on 16k pages).
+  FEXCore::Allocator::SetWineAppleLastGoodTeb(reinterpret_cast<void*>(Teb));
+}
+
+__attribute__((noinline)) static uintptr_t FEXResolveWineTeb() {
+  // Prefer raw tpidr/x18. wine_get_current_teb is a PE export — calling it
+  // during ProcessInit/ThreadInit re-enters arm64x_check_call and can hit
+  // exit_thunk → c000001d before hybrid dispatch is stable.
+  uintptr_t Teb {};
+  uintptr_t X18 {};
+  asm volatile("mrs %0, tpidr_el0" : "=r"(Teb) :: "memory");
+  if (FEXIsPlausibleWineTeb(Teb)) {
+    return Teb;
+  }
+  asm volatile("mov %0, x18" : "=r"(X18));
+  if (FEXIsPlausibleWineTeb(X18)) {
+    return X18;
+  }
+  // BeginSimulation: tpidr/x18 often zero after loader C — ThreadInit host-slab stash.
+  const uintptr_t Last = reinterpret_cast<uintptr_t>(FEXCore::Allocator::GetWineAppleLastGoodTeb());
+  if (FEXIsPlausibleWineTeb(Last)) {
+    return Last;
+  }
+  // After process_attach hybrid is up — ntdll last_good via wine_get_current_teb.
+  if (FEXWineGetCurrentTeb) {
+    const uintptr_t FromWine = reinterpret_cast<uintptr_t>(FEXWineGetCurrentTeb());
+    if (FEXIsPlausibleWineTeb(FromWine)) {
+      return FromWine;
+    }
+  }
+  return 0;
+}
+
+__attribute__((noinline)) static void FEXSyncTebX18() {
+  const uintptr_t Teb = FEXResolveWineTeb();
+  if (!Teb) {
+    return;
+  }
+  asm volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Teb) : "x18", "memory");
+}
+
+static inline _TEB* FEXNtCurrentTeb_Wine() {
+  return reinterpret_cast<_TEB*>(FEXResolveWineTeb());
+}
+#undef NtCurrentTeb
+#define NtCurrentTeb() FEXNtCurrentTeb_Wine()
+
+// Early ProcessInit must not route through Wine's syscall dispatcher: patched ntdll thunks
+// target x64 fast-forward sequences before FEX's JIT is ready. Use host mmap/mprotect instead.
+static constexpr size_t FEX_WINE_APPLE_PAGE_SIZE = 16384;
+
+// Darwin SVC may clobber x18; never leave tpidr/x18 as MAP flags (0x1002) or garbage.
+static void FEXWineAppleRestoreTeb(uintptr_t SavedTeb) {
+  if (FEXIsPlausibleWineTeb(SavedTeb)) {
+    asm volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(SavedTeb) : "x18", "memory");
+  } else {
+    FEXSyncTebX18();
+  }
+}
+
+static uintptr_t FEXWineAppleSaveTeb() {
+  return FEXResolveWineTeb();
+}
+
+static void* FEXWineAppleMmap(size_t Size) {
+  void* Result {};
+  const uintptr_t Len = Size;
+  const uintptr_t SavedTeb = FEXWineAppleSaveTeb();
+  __asm__ volatile("mov x16, #197\n\t" /* SYS_mmap */
+                   "mov x0, #0\n\t"
+                   "mov x1, %1\n\t"
+                   "mov x2, #3\n\t"       /* PROT_READ | PROT_WRITE */
+                   "mov x3, #0x1002\n\t"  /* MAP_PRIVATE | MAP_ANON */
+                   "mov x4, #-1\n\t"
+                   "mov x5, #0\n\t"
+                   "svc #0x80\n\t"
+                   "mov %0, x0"
+                   : "=r"(Result)
+                   : "r"(Len)
+                   : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "x18", "memory", "cc");
+  FEXWineAppleRestoreTeb(SavedTeb);
+  if (reinterpret_cast<intptr_t>(Result) < 0) {
+    return nullptr;
+  }
+  return Result;
+}
+
+static void FEXWineAppleMunmap(void* Ptr, size_t Size) {
+  const uintptr_t Addr = reinterpret_cast<uintptr_t>(Ptr);
+  const uintptr_t Len = Size;
+  const uintptr_t SavedTeb = FEXWineAppleSaveTeb();
+  __asm__ volatile("mov x16, #73\n\t" /* SYS_munmap */
+                   "mov x0, %0\n\t"
+                   "mov x1, %1\n\t"
+                   "svc #0x80"
+                   :
+                   : "r"(Addr), "r"(Len)
+                   : "x0", "x1", "x16", "x18", "memory", "cc");
+  FEXWineAppleRestoreTeb(SavedTeb);
+}
+
+static int FEXEarlyStrcmp(const char* A, const char* B) {
+  while (*A && *A == *B) {
+    A++;
+    B++;
+  }
+  return static_cast<unsigned char>(*A) - static_cast<unsigned char>(*B);
+}
+
+static bool FEXWineAppleMprotect(void* Address, size_t Size, int Prot) {
+  const uintptr_t Start = reinterpret_cast<uintptr_t>(Address) & ~(FEX_WINE_APPLE_PAGE_SIZE - 1);
+  const uintptr_t End = (reinterpret_cast<uintptr_t>(Address) + Size + FEX_WINE_APPLE_PAGE_SIZE - 1) & ~(FEX_WINE_APPLE_PAGE_SIZE - 1);
+  long Ret {};
+  const uintptr_t Len = End - Start;
+  const uintptr_t SavedTeb = FEXWineAppleSaveTeb();
+  __asm__ volatile("mov x16, #74\n\t" /* SYS_mprotect */
+                   "mov x0, %1\n\t"
+                   "mov x1, %2\n\t"
+                   "mov x2, %3\n\t"
+                   "svc #0x80\n\t"
+                   "mov %0, x0"
+                   : "=r"(Ret)
+                   : "r"(Start), "r"(Len), "r"(Prot)
+                   : "x0", "x1", "x2", "x16", "x18", "memory", "cc");
+  FEXWineAppleRestoreTeb(SavedTeb);
+  return Ret == 0;
+}
+
+#else
+static inline void FEXSyncTebX18() {}
+
+static int FEXEarlyStrcmp(const char* A, const char* B) {
+  return strcmp(A, B);
+}
+#endif
+
+static IMAGE_NT_HEADERS64* FEXGetNtHeaders(HMODULE Module) {
+  const auto* Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(Module);
+  return reinterpret_cast<IMAGE_NT_HEADERS64*>(reinterpret_cast<uintptr_t>(Module) + Dos->e_lfanew);
+}
+
+static void* FEXGetImageDirectoryEntry(HMODULE Module, DWORD Directory) {
+  const auto* Nt = FEXGetNtHeaders(Module);
+  const auto& Entry = Nt->OptionalHeader.DataDirectory[Directory];
+  if (!Entry.VirtualAddress || !Entry.Size) {
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Module) + Entry.VirtualAddress);
+}
+
+static void* FEXGetExportByName(HMODULE Module, const char* Name) {
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(Module);
+  const auto* Exports = static_cast<const IMAGE_EXPORT_DIRECTORY*>(FEXGetImageDirectoryEntry(Module, IMAGE_DIRECTORY_ENTRY_EXPORT));
+  if (!Exports) {
+    return nullptr;
+  }
+
+  const auto* NameTable = reinterpret_cast<const uint32_t*>(Base + Exports->AddressOfNames);
+  const auto* FunctionTable = reinterpret_cast<const uint32_t*>(Base + Exports->AddressOfFunctions);
+  const auto* OrdinalTable = reinterpret_cast<const uint16_t*>(Base + Exports->AddressOfNameOrdinals);
+  for (DWORD Idx = 0; Idx < Exports->NumberOfNames; Idx++) {
+    const char* ExportName = reinterpret_cast<const char*>(Base + NameTable[Idx]);
+    if (FEXEarlyStrcmp(ExportName, Name) == 0) {
+      return reinterpret_cast<void*>(Base + FunctionTable[OrdinalTable[Idx]]);
+    }
+  }
+  return nullptr;
+}
+
+#if FEX_ON_WINE_APPLE
+struct FEXWineChpeProcessInfo {
+  ULONG Wow64ExecuteFlags;
+  USHORT NativeMachineType;
+  USHORT EmulatedMachineType;
+  HANDLE SectionHandle;
+  void* CrossProcessWorkList;
+  void* unknown;
+};
+
+__attribute__((noinline)) static HMODULE FEXGetNtDllFromWineProcessInfo() {
+  static constexpr uintptr_t WINE_PEB64_SIZE = 0x7c8;
+  static constexpr uintptr_t CHPE_UNKNOWN_OFFSET = offsetof(FEXWineChpeProcessInfo, unknown);
+  const uintptr_t Teb = FEXResolveWineTeb();
+  if (!Teb) {
+    return nullptr;
+  }
+  const uintptr_t Peb = *reinterpret_cast<const uintptr_t*>(Teb + 0x60);
+  return reinterpret_cast<HMODULE>(*reinterpret_cast<const uintptr_t*>(Peb + WINE_PEB64_SIZE + CHPE_UNKNOWN_OFFSET));
+}
+
+__attribute__((noinline)) static uintptr_t FEXGetImageBaseFromPeb() {
+  const uintptr_t Teb = FEXResolveWineTeb();
+  if (!Teb) {
+    return 0;
+  }
+  const uintptr_t Peb = *reinterpret_cast<const uintptr_t*>(Teb + 0x60);
+  return *reinterpret_cast<const uintptr_t*>(Peb + offsetof(__PEB, ImageBaseAddress));
+}
+#endif
 
 struct ThreadCPUArea {
   static constexpr size_t TEBCPUAreaOffset = 0x1788;
   CHPE_V2_CPU_AREA_INFO* Area;
 
   explicit ThreadCPUArea(_TEB* TEB)
-    : Area(*reinterpret_cast<CHPE_V2_CPU_AREA_INFO**>(reinterpret_cast<uintptr_t>(TEB) + TEBCPUAreaOffset)) {}
+    : Area(nullptr) {
+    if (!TEB) {
+      return;
+    }
+    Area = *reinterpret_cast<CHPE_V2_CPU_AREA_INFO**>(reinterpret_cast<uintptr_t>(TEB) + TEBCPUAreaOffset);
+  }
+
+  bool valid() const {
+    return Area != nullptr;
+  }
 
   uint64_t& EmulatorStackLimit() const {
     return Area->EmulatorStackLimit;
@@ -147,6 +384,16 @@ std::recursive_mutex ThreadCreationMutex;
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
+static uintptr_t GetTebAddress() {
+#if FEX_ON_WINE_APPLE
+  return FEXResolveWineTeb();
+#else
+  uintptr_t Teb {};
+  asm volatile("mov %0, x18" : "=r"(Teb));
+  return Teb;
+#endif
+}
+
 std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
   THREAD_BASIC_INFORMATION Info;
   const NTSTATUS Err = NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
@@ -154,8 +401,212 @@ std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
 }
 
 ThreadCPUArea GetCPUArea() {
-  return ThreadCPUArea(NtCurrentTeb());
+  const uintptr_t Teb = GetTebAddress();
+  FEXSyncTebX18();
+  ThreadCPUArea CPUArea {reinterpret_cast<_TEB*>(Teb)};
+  return CPUArea;
 }
+
+// Wine-apple never assigns file-scope CTX (RO .rdata on 16k pages); context lives
+// in Allocator WineApple stash. Using null CTX makes LLVM emit brk in SyncThreadContext.
+static FEXCore::Context::Context* GetFEXContext() {
+#if FEX_ON_WINE_APPLE
+  return static_cast<FEXCore::Context::Context*>(FEXCore::Allocator::GetWineAppleContext());
+#else
+  return CTX.get();
+#endif
+}
+
+#if FEX_ON_WINE_APPLE
+// Module.S: misaligned-SP path needs x86 `ret` page without writing PE globals.
+extern "C" void* FEXGetX64ReturnInstr() {
+  return FEXCore::Allocator::GetOrCreateX64ReturnInstr();
+}
+
+// EnterEC miss path: seed L1 with universal host stub; return host code address.
+// No full JIT — proves enter_jit → L1 → host code without PassManager/CPUBackend.
+extern "C" uint64_t FEXWineAppleCompileStub(uint64_t FrameU, uint64_t GuestRIP) {
+  auto* Frame = reinterpret_cast<FEXCore::Core::CpuStateFrame*>(FrameU);
+  void* Stub = FEXCore::Allocator::GetOrCreateWineAppleHostRetStub();
+  const uint64_t Host = Stub ? reinterpret_cast<uint64_t>(Stub) : 0;
+  if (Frame && Frame->State.L1Pointer && Host) {
+    const uint64_t Off = GuestRIP & Frame->State.L1Mask;
+    auto* E = reinterpret_cast<volatile uint64_t*>(Frame->State.L1Pointer + Off);
+    E[0] = Host;     // HostCode
+    E[1] = GuestRIP; // GuestCode
+  }
+  return Host;
+}
+
+// C linkage for Module.S enter_jit — re-bind CHPE EmulatorData every entry.
+// jul9e: TEB->ChpeV2CpuAreaInfo->EmulatorData[0..2] were NULL at P8 after ThreadInit.
+// Module.S: PE-resident EnterEC (Darwin W^X-safe).
+extern "C" void WineAppleEnterEC();
+// Gate lb: real FillSRA (LoopTop+CompileBlock). EnterEC dispatcher is ret-only
+// on wine-apple (Dispatcher.cpp); FillSRA is the RX-safe JIT entry.
+extern "C" uint64_t WineAppleRealFillSRA;
+uint64_t WineAppleRealFillSRA = 0;
+
+extern "C" void FEXSyncTebX18ForEnter() {
+  // TEB only — no GetCurrentThreadId/Threads (hybrid fault). Prefer Resolve, then slab.
+  FEXSyncTebX18();
+  uintptr_t X18 {};
+  asm volatile("mov %0, x18" : "=r"(X18));
+  if (FEXIsPlausibleWineTeb(X18)) {
+    return;
+  }
+  const uintptr_t Last = reinterpret_cast<uintptr_t>(FEXCore::Allocator::GetWineAppleLastGoodTeb());
+  if (FEXIsPlausibleWineTeb(Last)) {
+    asm volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Last) : "x18", "memory");
+  }
+}
+
+// BeginSimulation entry: load CHPE area from host slab (no TEB required).
+// Returns Area in x0; also restores TEB into x18/tpidr when possible.
+extern "C" void* FEXWineAppleBeginSimSetup() {
+  {
+    const char Msg[] = "BeginSim: enter\n";
+    register uint64_t x0 __asm__("x0") = 2;
+    register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+    register uint64_t x2 __asm__("x2") = sizeof(Msg) - 1;
+    register uint64_t x16 __asm__("x16") = 4;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+  }
+  FEXSyncTebX18ForEnter();
+  void* Area = FEXCore::Allocator::GetWineAppleCpuArea();
+  uintptr_t Teb {};
+  asm volatile("mov %0, x18" : "=r"(Teb));
+  if (!Area && FEXIsPlausibleWineTeb(Teb)) {
+    Area = *reinterpret_cast<void**>(Teb + 0x1788);
+  }
+  // Gate fk: ProcessHeap is valid before NtContinue; Invalid handle 0 still fires
+  // during/after NtContinue (null heap *arg*, not null ProcessHeap).
+  if (FEXIsPlausibleWineTeb(Teb)) {
+    const uintptr_t Peb = *reinterpret_cast<uintptr_t*>(Teb + 0x60);
+    const uintptr_t Heap = (Peb ? *reinterpret_cast<uintptr_t*>(Peb + 0x30) : 0);
+    char Msg[96];
+    size_t I = 0;
+    const char* Pfx = "BeginSim: teb/peb/heap=";
+    while (Pfx[I]) {
+      Msg[I] = Pfx[I];
+      ++I;
+    }
+    static const char Hex[] = "0123456789abcdef";
+    auto puthex = [&](uintptr_t V) {
+      Msg[I++] = '0';
+      Msg[I++] = 'x';
+      for (int S = 60; S >= 0; S -= 4) {
+        Msg[I++] = Hex[(V >> S) & 0xf];
+      }
+      Msg[I++] = ' ';
+    };
+    puthex(Teb);
+    puthex(Peb);
+    puthex(Heap);
+    Msg[I++] = '\n';
+    Msg[I] = 0;
+    register uint64_t x0 __asm__("x0") = 2;
+    register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+    register uint64_t x2 __asm__("x2") = I;
+    register uint64_t x16 __asm__("x16") = 4;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+    asm volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Teb) : "x18", "memory");
+  }
+  return Area;
+}
+
+// Called from BeginSimulation after SyncThreadContext with ContextAmd64 in x0.
+// Logs Rip/Rcx/Rsp and ensures ProcessHeap; returns Rip in x0 for br (0 = abort).
+// Gate fs (diag only): also log tpidr, ProcessParameters, CommandLine Buffer/Length
+// so the start.exe wmain addr-0x8 cliff can be classified (argv vs PEB vs TEB).
+extern "C" uint64_t FEXWineAppleBeforeNativeEntry(void* ContextAmd64) {
+  FEXSyncTebX18ForEnter();
+  uintptr_t Teb {};
+  uintptr_t Tpidr {};
+  asm volatile("mov %0, x18" : "=r"(Teb));
+  asm volatile("mrs %0, tpidr_el0" : "=r"(Tpidr));
+  uint64_t Rip = 0, Rcx = 0, Rdx = 0, Rsp = 0;
+  if (ContextAmd64) {
+    const auto* B = reinterpret_cast<const uint64_t*>(ContextAmd64);
+    // AMD64 CONTEXT offsets / 8: Rcx=0x10, Rdx=0x11, Rsp=0x13, Rip=0x1f
+    Rcx = B[0x80 / 8];
+    Rdx = B[0x88 / 8];
+    Rsp = B[0x98 / 8];
+    Rip = B[0xf8 / 8];
+  }
+  uintptr_t Heap = 0, Peb = 0, Params = 0, CmdBuf = 0;
+  uint32_t CmdLen = 0;
+  if (FEXIsPlausibleWineTeb(Teb)) {
+    Peb = *reinterpret_cast<uintptr_t*>(Teb + 0x60);
+    if (Peb) {
+      Heap = *reinterpret_cast<uintptr_t*>(Peb + 0x30);
+      // PEB.ProcessParameters @ +0x20; UNICODE_STRING CommandLine @ +0x70
+      // (Length @ +0, Buffer @ +8 on 64-bit).
+      Params = *reinterpret_cast<uintptr_t*>(Peb + 0x20);
+      if (Params) {
+        CmdLen = *reinterpret_cast<uint16_t*>(Params + 0x70);
+        CmdBuf = *reinterpret_cast<uintptr_t*>(Params + 0x78);
+      }
+    }
+  }
+  char Msg[256];
+  size_t I = 0;
+  auto put = [&](const char* S) {
+    while (*S && I + 1 < sizeof(Msg)) {
+      Msg[I++] = *S++;
+    }
+  };
+  auto puthex = [&](uint64_t V) {
+    static const char Hex[] = "0123456789abcdef";
+    put("0x");
+    for (int S = 60; S >= 0; S -= 4) {
+      if (I + 1 >= sizeof(Msg)) {
+        return;
+      }
+      Msg[I++] = Hex[(V >> S) & 0xf];
+    }
+    if (I + 1 < sizeof(Msg)) {
+      Msg[I++] = ' ';
+    }
+  };
+  put("BeforeNative: rip=");
+  puthex(Rip);
+  put("rcx=");
+  puthex(Rcx);
+  put("heap=");
+  puthex(Heap);
+  put("tpidr=");
+  puthex(Tpidr);
+  put("x18=");
+  puthex(Teb);
+  put("params=");
+  puthex(Params);
+  put("cmdlen=");
+  puthex(CmdLen);
+  put("cmdbuf=");
+  puthex(CmdBuf);
+  put("rsp=");
+  puthex(Rsp);
+  if (I + 1 < sizeof(Msg)) {
+    Msg[I++] = '\n';
+  }
+  Msg[I] = 0;
+  {
+    register uint64_t x0 __asm__("x0") = 2;
+    register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+    register uint64_t x2 __asm__("x2") = I;
+    register uint64_t x16 __asm__("x16") = 4;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+  }
+  if (FEXIsPlausibleWineTeb(Teb)) {
+    asm volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Teb) : "x18", "memory");
+  }
+  (void)Rdx;
+  // Gate lc BeforeNative→FillSRA: pin past c000001d (lc3–lc5 HostRetStub spin)
+  // but EiC tip regressed OPENGL-140 (lc5s1/3/4/5). Reverted for tip hold.
+  return Rip;
+}
+#endif
 
 FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
@@ -166,15 +617,57 @@ bool IsEmulatorStackAddress(const ThreadCPUArea CPUArea, uint64_t Address) {
 }
 
 bool IsDispatcherAddress(uint64_t Address) {
+  if (!SignalDelegator) {
+    return false;
+  }
   const auto& Config = SignalDelegator->GetConfig();
   return Address >= Config.DispatcherBegin && Address < Config.DispatcherEnd;
 }
 
+struct FexLdrData {
+  ULONG Length;
+  BOOLEAN Initialized;
+  PVOID SsHandle;
+  LIST_ENTRY InLoadOrderModuleList;
+  LIST_ENTRY InMemoryOrderModuleList;
+  LIST_ENTRY InInitializationOrderModuleList;
+};
 
-void FillNtDllLUTs(HMODULE NtDll) {
-  ULONG Size;
+struct FexLdrEntry {
+  LIST_ENTRY InMemoryOrderLinks;
+  LIST_ENTRY InInitializationOrderLinks;
+  LIST_ENTRY InLoadOrderLinks;
+  PVOID DllBase;
+  PVOID EntryPoint;
+  ULONG SizeOfImage;
+  UNICODE_STRING FullDllName;
+  UNICODE_STRING BaseDllName;
+};
+
+static HMODULE GetModuleFromPeb(const wchar_t* Name) {
+  uintptr_t Teb {};
+#if FEX_ON_WINE_APPLE
+  asm volatile("mrs %0, tpidr_el0" : "=r"(Teb) :: "memory");
+#else
+  asm volatile("mov %0, x18" : "=r"(Teb));
+#endif
+  const uintptr_t Peb = *reinterpret_cast<const uintptr_t*>(Teb + 0x60);
+  const uintptr_t Ldr = *reinterpret_cast<const uintptr_t*>(Peb + offsetof(__PEB, LdrData));
+  const uintptr_t Head = Ldr + offsetof(FexLdrData, InMemoryOrderModuleList);
+  uintptr_t Cur = *reinterpret_cast<const uintptr_t*>(Head);
+  while (Cur != Head) {
+    const auto* Entry = reinterpret_cast<const FexLdrEntry*>(Cur - offsetof(FexLdrEntry, InMemoryOrderLinks));
+    if (Entry->BaseDllName.Buffer && _wcsicmp(Entry->BaseDllName.Buffer, Name) == 0) {
+      return reinterpret_cast<HMODULE>(Entry->DllBase);
+    }
+    Cur = *reinterpret_cast<const uintptr_t*>(Cur);
+  }
+  return nullptr;
+}
+
+bool FillNtDllLUTs(HMODULE NtDll) {
   const auto* LoadConfig =
-    reinterpret_cast<_IMAGE_LOAD_CONFIG_DIRECTORY64*>(RtlImageDirectoryEntryToData(NtDll, true, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &Size));
+    reinterpret_cast<_IMAGE_LOAD_CONFIG_DIRECTORY64*>(FEXGetImageDirectoryEntry(NtDll, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG));
   const auto* CHPEMetadata = reinterpret_cast<IMAGE_ARM64EC_METADATA*>(LoadConfig->CHPEMetadataPointer);
   const auto* RedirectionTableBegin = reinterpret_cast<IMAGE_ARM64EC_REDIRECTION_ENTRY*>(NtDllBase + CHPEMetadata->RedirectionMetadata);
   const auto* RedirectionTableEnd = RedirectionTableBegin + CHPEMetadata->RedirectionMetadataCount;
@@ -182,11 +675,28 @@ void FillNtDllLUTs(HMODULE NtDll) {
   NtDllRedirectionLUTSize = std::prev(RedirectionTableEnd)->Source + 1;
 
   SIZE_T AllocSize = NtDllRedirectionLUTSize * sizeof(uint32_t);
-  NtAllocateVirtualMemoryNative(NtCurrentProcess(), reinterpret_cast<void**>(&NtDllRedirectionLUT), 0, &AllocSize, MEM_COMMIT | MEM_RESERVE,
-                                PAGE_READWRITE);
+  PVOID LutBase = nullptr;
+#if FEX_ON_WINE_APPLE
+  LutBase = FEXWineAppleMmap(AllocSize);
+  if (!LutBase) {
+    NtDllRedirectionLUT = nullptr;
+    NtDllRedirectionLUTSize = 0;
+    return false;
+  }
+#else
+  const NTSTATUS Status =
+    NtAllocateVirtualMemoryNative(NtCurrentProcess(), &LutBase, 0, &AllocSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!NT_SUCCESS(Status) || !LutBase) {
+    NtDllRedirectionLUT = nullptr;
+    NtDllRedirectionLUTSize = 0;
+    return false;
+  }
+#endif
+  NtDllRedirectionLUT = static_cast<uint32_t*>(LutBase);
   for (auto It = RedirectionTableBegin; It != RedirectionTableEnd; It++) {
     NtDllRedirectionLUT[It->Source] = It->Destination;
   }
+  return true;
 }
 
 template<typename T>
@@ -196,21 +706,31 @@ void WriteModuleRVA(HMODULE Module, LONG RVA, T Data) {
   }
 
   void* Address = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Module) + RVA);
+#if FEX_ON_WINE_APPLE
+  FEXWineAppleMprotect(Address, sizeof(T), 3 /* PROT_READ | PROT_WRITE */);
+  *reinterpret_cast<T*>(Address) = Data;
+#else
   void* ProtAddress = Address;
   SIZE_T ProtSize = sizeof(T);
   ULONG Prot;
   NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, PAGE_READWRITE, &Prot);
   *reinterpret_cast<T*>(Address) = Data;
   NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, Prot, nullptr);
+#endif
 }
 
 void PatchCallChecker() {
   // See the comment for CheckCall in Module.S for why this is necessary
   const auto Module = reinterpret_cast<HMODULE>(&__ImageBase);
-  ULONG Size;
   const auto* LoadConfig =
-    reinterpret_cast<_IMAGE_LOAD_CONFIG_DIRECTORY64*>(RtlImageDirectoryEntryToData(Module, true, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &Size));
+    reinterpret_cast<_IMAGE_LOAD_CONFIG_DIRECTORY64*>(FEXGetImageDirectoryEntry(Module, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG));
   const auto* CHPEMetadata = reinterpret_cast<IMAGE_ARM64EC_METADATA*>(LoadConfig->CHPEMetadataPointer);
+#if FEX_ON_WINE_APPLE
+  if (CHPEMetadata->__os_arm64x_dispatch_call) {
+    WineFallbackCheckCall = *reinterpret_cast<void* const*>(
+      reinterpret_cast<uintptr_t>(Module) + CHPEMetadata->__os_arm64x_dispatch_call);
+  }
+#endif
   WriteModuleRVA(Module, CHPEMetadata->__os_arm64x_dispatch_call, &CheckCall);
   WriteModuleRVA(Module, CHPEMetadata->__os_arm64x_dispatch_icall, &CheckCall);
   WriteModuleRVA(Module, CHPEMetadata->__os_arm64x_dispatch_icall_cfg, &CheckCall);
@@ -218,8 +738,7 @@ void PatchCallChecker() {
 
 // Fills in the syscall numbers necessary to call *Native variants of syscalls from FEX under wine.
 void ParseWineSyscallNumbers(HMODULE NtDll) {
-  ULONG Size;
-  const auto* Exports = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(RtlImageDirectoryEntryToData(NtDll, true, IMAGE_DIRECTORY_ENTRY_EXPORT, &Size));
+  const auto* Exports = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(FEXGetImageDirectoryEntry(NtDll, IMAGE_DIRECTORY_ENTRY_EXPORT));
   const auto* NameTable = reinterpret_cast<uint32_t*>(NtDllBase + Exports->AddressOfNames);
   const auto* FunctionTable = reinterpret_cast<uint32_t*>(NtDllBase + Exports->AddressOfFunctions);
   const auto* OrdinalTable = reinterpret_cast<uint16_t*>(NtDllBase + Exports->AddressOfNameOrdinals);
@@ -240,44 +759,131 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
   // which we need to manually issue. Note that all functions starting with Nt besides NtGetTickCount are syscalls.
   for (uint32_t Idx = 0; Idx < Exports->NumberOfNames; Idx++) {
     const char* Name = reinterpret_cast<const char*>(NtDllBase + NameTable[Idx]);
-    if (Name[0] == 'N' && Name[1] == 't' && strcmp(Name, "NtGetTickCount") != 0) {
+    if (Name[0] == 'N' && Name[1] == 't' && FEXEarlyStrcmp(Name, "NtGetTickCount") != 0) {
       *SyscallTableEnd++ = {Name, FunctionTable[OrdinalTable[Idx]]};
     }
   }
 
-  // Sort such that index 0 is now syscall 0, etc
-  std::sort(SyscallTable.begin(), SyscallTableEnd);
+  // Sort such that index 0 is now syscall 0, etc. Avoid libc++ introspect sort during early init.
+  for (auto It = SyscallTable.begin(); It != SyscallTableEnd; It++) {
+    for (auto Jt = It + 1; Jt != SyscallTableEnd; Jt++) {
+      if (Jt->RVA < It->RVA) {
+        const SyscallEntry Tmp = *It;
+        *It = *Jt;
+        *Jt = Tmp;
+      }
+    }
+  }
 
   for (auto it = SyscallTable.begin(); it != SyscallTableEnd; it++) {
     uint32_t CurSyscallId = static_cast<uint32_t>(std::distance(SyscallTable.begin(), it));
-    if (strcmp(it->Name, "NtContinue") == 0) {
+    if (FEXEarlyStrcmp(it->Name, "NtContinue") == 0) {
       WineNtContinueSyscallId = CurSyscallId;
-    } else if (strcmp(it->Name, "NtAllocateVirtualMemory") == 0) {
+    } else if (FEXEarlyStrcmp(it->Name, "NtAllocateVirtualMemory") == 0) {
       WineNtAllocateVirtualMemorySyscallId = CurSyscallId;
-    } else if (strcmp(it->Name, "NtProtectVirtualMemory") == 0) {
+    } else if (FEXEarlyStrcmp(it->Name, "NtProtectVirtualMemory") == 0) {
       WineNtProtectVirtualMemorySyscallId = CurSyscallId;
+    } else if (FEXEarlyStrcmp(it->Name, "NtFreeVirtualMemory") == 0) {
+      WineNtFreeVirtualMemorySyscallId = CurSyscallId;
     }
   }
 }
+
+#if FEX_ON_WINE_APPLE
+// Minimal host-mmap slab for rpmalloc — avoid Wine NtAllocate* this early.
+static constexpr size_t FEX_RPMALLOC_SLAB_SIZE = 64ull << 20; // 64 MiB
+static void* FEXRPMallocSlab {};
+static size_t FEXRPMallocSlabUsed {};
+
+static void* WineRPMallocMap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
+  if (!FEXRPMallocSlab) {
+    FEXRPMallocSlab = FEXWineAppleMmap(FEX_RPMALLOC_SLAB_SIZE);
+    FEXRPMallocSlabUsed = 0;
+    if (!FEXRPMallocSlab) {
+      return nullptr;
+    }
+  }
+  size_t Align = alignment ? alignment : 16;
+  size_t Pad = (Align - (FEXRPMallocSlabUsed % Align)) % Align;
+  size_t Need = Pad + size;
+  if (FEXRPMallocSlabUsed + Need > FEX_RPMALLOC_SLAB_SIZE) {
+    // Fall back to a fresh host mapping for large/overflow spans
+    void* Extra = FEXWineAppleMmap(size + Align);
+    if (!Extra) {
+      return nullptr;
+    }
+    uintptr_t P = reinterpret_cast<uintptr_t>(Extra);
+    size_t Off = (Align - (P % Align)) % Align;
+    *offset = Off;
+    *mapped_size = size + Align;
+    return reinterpret_cast<void*>(P + Off);
+  }
+  *offset = Pad;
+  *mapped_size = Need;
+  void* Result = reinterpret_cast<char*>(FEXRPMallocSlab) + FEXRPMallocSlabUsed + Pad;
+  FEXRPMallocSlabUsed += Need;
+  return Result;
+}
+
+static void WineRPMallocUnmap(void* address, size_t offset, size_t mapped_size) {
+  // Slab bump allocator: only unmap standalone overflow mappings (outside slab).
+  auto* Base = reinterpret_cast<char*>(address) - offset;
+  auto* Slab = reinterpret_cast<char*>(FEXRPMallocSlab);
+  if (FEXRPMallocSlab && Base >= Slab && Base < Slab + static_cast<ptrdiff_t>(FEX_RPMALLOC_SLAB_SIZE)) {
+    return;
+  }
+  FEXWineAppleMunmap(Base, mapped_size);
+}
+
+static void InitWineRPMalloc() {
+  static rpmalloc_interface_t Interface {
+    .memory_map = WineRPMallocMap,
+    .memory_unmap = WineRPMallocUnmap,
+  };
+  static rpmalloc_config_t Config {
+    .page_size = FEX_WINE_APPLE_PAGE_SIZE, // 16K host pages
+    .enable_huge_pages = 0,
+    .unmap_on_finalize = 0,
+  };
+  // Pre-create host slab before rpmalloc's first map callback.
+  size_t DummyOff = 0, DummyMap = 0;
+  (void)WineRPMallocMap(64, 16, &DummyOff, &DummyMap);
+  rpmalloc_initialize_config(&Interface, &Config);
+}
+#endif
 
 // Syscall thunks may have been patched before FEX has loaded, the default call checker installed by ntdll into FEX will
 // try to invoke the JIT when calling such patched syscalls but this obviously doesn't work before FEX is initalised.
 // This function parses ntdll and sets up a custom call checker to prevent this, as such it must avoid using any syscall
 // thunks itself.
-void InitSyscalls() {
-  // The ntdll exports called by GetModuleHandle/GetProcAddress aren't known to be patched before JIT init by any current
-  // software so are safe to call, but if that changes the loader structures in the PEB could be parsed manually.
-  const auto NtDll = GetModuleHandle("ntdll.dll");
+__attribute__((noinline)) void InitSyscalls() {
+#if FEX_ON_WINE_APPLE
+  const auto NtDll = FEXGetNtDllFromWineProcessInfo();
+#else
+  const auto NtDll = GetModuleFromPeb(L"ntdll.dll");
+#endif
+  if (!NtDll) {
+    return;
+  }
   NtDllBase = reinterpret_cast<uintptr_t>(NtDll);
+  FEXWineGetCurrentTeb = reinterpret_cast<WineGetCurrentTeb_t>(FEXGetExportByName(NtDll, "wine_get_current_teb"));
 
-  const auto WineSyscallDispatcherPtr = reinterpret_cast<void**>(GetProcAddress(NtDll, "__wine_syscall_dispatcher"));
+  void* SavedWineSyscallDispatcher = nullptr;
+  const auto WineSyscallDispatcherPtr = reinterpret_cast<void**>(FEXGetExportByName(NtDll, "__wine_syscall_dispatcher"));
   if (WineSyscallDispatcherPtr) {
-    WineSyscallDispatcher = *WineSyscallDispatcherPtr;
-    ParseWineSyscallNumbers(NtDll);
+    SavedWineSyscallDispatcher = *WineSyscallDispatcherPtr;
+    WineSyscallDispatcher = nullptr;
   }
 
-  FillNtDllLUTs(NtDll);
+  if (!FillNtDllLUTs(NtDll)) {
+    return;
+  }
   PatchCallChecker();
+
+  if (WineSyscallDispatcherPtr) {
+    ParseWineSyscallNumbers(NtDll);
+    WineSyscallDispatcher = SavedWineSyscallDispatcher;
+  }
 }
 
 void HandleImageMap(uint64_t Address, bool MainImage = false) {
@@ -290,6 +896,7 @@ void HandleImageMap(uint64_t Address, bool MainImage = false) {
 void HandleImageUnmap(uint64_t Address, uint64_t Size) {
   ImageTracker->HandleImageUnmap(Address, Size);
 }
+
 } // namespace
 
 namespace Exception {
@@ -314,6 +921,13 @@ static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
 }
 
 static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
+  if (!Thread || !Thread->CurrentFrame) {
+    return;
+  }
+  auto* FexCtx = GetFEXContext();
+  if (!FexCtx) {
+    return;
+  }
   auto& State = Thread->CurrentFrame->State;
 
   if ((Context.ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
@@ -339,7 +953,7 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
     State.rip = Context.Rip;
     State.gregs[FEXCore::X86State::REG_RSP] = Context.Rsp;
     State.gregs[FEXCore::X86State::REG_RBP] = Context.Rbp;
-    CTX->SetFlagsFromCompactedEFLAGS(Thread, Context.EFlags);
+    FexCtx->SetFlagsFromCompactedEFLAGS(Thread, Context.EFlags);
   }
 
   if ((Context.ContextFlags & CONTEXT_SEGMENTS) == CONTEXT_SEGMENTS) {
@@ -367,10 +981,10 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
     // Floating-point register state
     if ((Context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE) {
       const auto* Ymm = RtlLocateExtendedFeature(reinterpret_cast<CONTEXT_EX*>(&Context + 1), XSTATE_AVX, nullptr);
-      CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters),
-                                    reinterpret_cast<const __uint128_t*>(Ymm));
+      FexCtx->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters),
+                                       reinterpret_cast<const __uint128_t*>(Ymm));
     } else {
-      CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters), nullptr);
+      FexCtx->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters), nullptr);
     }
     memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
 
@@ -454,7 +1068,7 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   // Zero all disallowed registers
   ECContext.X13 = 0;
   ECContext.X14 = 0;
-  ECContext.X18 = 0;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(ECContext.X18));
   ECContext.X23 = 0;
   ECContext.X24 = 0;
   ECContext.X28 = 0;
@@ -560,46 +1174,345 @@ public:
     ProcessPendingCrossProcessEmulatorWork();
   }
 };
+
+void SetKiUserExceptionDispatcher(uintptr_t Addr) {
+  KiUserExceptionDispatcher = Addr;
+}
 } // namespace Exception
 
-extern "C" void SyncThreadContext(CONTEXT* Context) {
+#if FEX_ON_WINE_APPLE
+static void FinishWineAppleProcessInit() {
+  const auto NtDll = reinterpret_cast<HMODULE>(NtDllBase);
+
+  SignalDelegator = fextl::make_unique<FEX::DummyHandlers::DummySignalDelegator>();
+  SyscallHandler = fextl::make_unique<Exception::ECSyscallHandler>();
+  CTX->SetSignalDelegator(SignalDelegator.get());
+  CTX->SetSyscallHandler(SyscallHandler.get());
+
+  Exception::HandlerConfig.emplace(*CTX);
+  InvalidationTracker.emplace(*CTX, Threads);
+  ImageTracker.emplace(*CTX, false);
+
+  const auto MainModule = reinterpret_cast<uintptr_t>(reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress);
+  HandleImageMap(MainModule, true);
+  HandleImageMap(NtDllBase);
+
+  CPUFeatures.emplace(*CTX);
+
+  X64ReturnInstr = FEXWineAppleMmap(FEXCore::Utils::FEX_PAGE_SIZE);
+  if (X64ReturnInstr) {
+    FEXWineAppleMprotect(X64ReturnInstr, FEXCore::Utils::FEX_PAGE_SIZE, 7);
+    InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(X64ReturnInstr), FEXCore::Utils::FEX_PAGE_SIZE,
+                                                            PAGE_EXECUTE_READ);
+    *reinterpret_cast<uint8_t*>(X64ReturnInstr) = 0xc3;
+  }
+
+  const uintptr_t KiUserExceptionDispatcherFFS = reinterpret_cast<uintptr_t>(FEXGetExportByName(NtDll, "KiUserExceptionDispatcher"));
+  if (KiUserExceptionDispatcherFFS && NtDllRedirectionLUT) {
+    Exception::SetKiUserExceptionDispatcher(NtDllRedirectionLUT[KiUserExceptionDispatcherFFS - NtDllBase] + NtDllBase);
+  }
+}
+#endif
+
+// Persist the current JIT GPR state into ContextAmd64 before leaving simulation.
+extern "C" void StoreJitStateToContextAmd64() {
+  FEXSyncTebX18();
   ProcessPendingCrossProcessEmulatorWork();
-  auto* Thread = GetCPUArea().ThreadState();
+  const auto CPUArea = GetCPUArea();
+  auto* Thread = CPUArea.ThreadState();
+  FEXCore::Core::CpuStateFrame* Frame = Thread ? Thread->CurrentFrame : CPUArea.StateFrame();
+  if (!Frame || !CPUArea.Area || !CPUArea.Area->ContextAmd64) {
+    return;
+  }
+
+  auto& State = Frame->State;
+  auto& Ctx = CPUArea.ContextAmd64().AMD64_Context;
+  Ctx.ContextFlags |= CONTEXT_INTEGER | CONTEXT_CONTROL;
+  Ctx.Rax = State.gregs[FEXCore::X86State::REG_RAX];
+  Ctx.Rcx = State.gregs[FEXCore::X86State::REG_RCX];
+  Ctx.Rdx = State.gregs[FEXCore::X86State::REG_RDX];
+  Ctx.Rbx = State.gregs[FEXCore::X86State::REG_RBX];
+  Ctx.Rsp = State.gregs[FEXCore::X86State::REG_RSP];
+  Ctx.Rbp = State.gregs[FEXCore::X86State::REG_RBP];
+  Ctx.Rsi = State.gregs[FEXCore::X86State::REG_RSI];
+  Ctx.Rdi = State.gregs[FEXCore::X86State::REG_RDI];
+  Ctx.R8 = State.gregs[FEXCore::X86State::REG_R8];
+  Ctx.R9 = State.gregs[FEXCore::X86State::REG_R9];
+  Ctx.R10 = State.gregs[FEXCore::X86State::REG_R10];
+  Ctx.R11 = State.gregs[FEXCore::X86State::REG_R11];
+  Ctx.R12 = State.gregs[FEXCore::X86State::REG_R12];
+  Ctx.R13 = State.gregs[FEXCore::X86State::REG_R13];
+  Ctx.R14 = State.gregs[FEXCore::X86State::REG_R14];
+  Ctx.R15 = State.gregs[FEXCore::X86State::REG_R15];
+  Ctx.Rip = State.rip;
+}
+
+// Marshal x64 JIT GPR state into ARM64EC CPU registers before calling an entry thunk.
+// x9 must already hold the target function address; x17 holds the entry thunk.
+extern "C" void ApplyJitStateToCpuForEcEntry() {
+  FEXSyncTebX18();
+  ProcessPendingCrossProcessEmulatorWork();
+  const auto CPUArea = GetCPUArea();
+  auto* Thread = CPUArea.ThreadState();
+  FEXCore::Core::CpuStateFrame* Frame = Thread ? Thread->CurrentFrame : CPUArea.StateFrame();
+  const CONTEXT* Amd64Ctx = (CPUArea.Area && CPUArea.Area->ContextAmd64) ? &CPUArea.ContextAmd64().AMD64_Context : nullptr;
+
+  uint64_t x0 {};
+  uint64_t x1 {};
+  uint64_t x2 {};
+  uint64_t x3 {};
+  uint64_t x5 {};
+  uint64_t x8 {};
+  uint64_t x19 {};
+  uint64_t x20 {};
+  uint64_t x21 {};
+  uint64_t x22 {};
+  uint64_t x25 {};
+  uint64_t x26 {};
+  uint64_t x27 {};
+  uint64_t fp {};
+  uint64_t sp {};
+
+  if (Frame) {
+    auto& State = Frame->State;
+    x0 = State.gregs[FEXCore::X86State::REG_RCX];
+    x1 = State.gregs[FEXCore::X86State::REG_RDX];
+    x2 = State.gregs[FEXCore::X86State::REG_R8];
+    x3 = State.gregs[FEXCore::X86State::REG_R9];
+    x5 = State.gregs[FEXCore::X86State::REG_R11];
+    x8 = State.gregs[FEXCore::X86State::REG_RAX];
+    x19 = State.gregs[FEXCore::X86State::REG_R12];
+    x20 = State.gregs[FEXCore::X86State::REG_R13];
+    x21 = State.gregs[FEXCore::X86State::REG_R14];
+    x22 = State.gregs[FEXCore::X86State::REG_R15];
+    x25 = State.gregs[FEXCore::X86State::REG_RSI];
+    x26 = State.gregs[FEXCore::X86State::REG_RDI];
+    x27 = State.gregs[FEXCore::X86State::REG_RBX];
+    fp = State.gregs[FEXCore::X86State::REG_RBP];
+    sp = State.gregs[FEXCore::X86State::REG_RSP];
+  } else if (Amd64Ctx && (Amd64Ctx->ContextFlags & CONTEXT_INTEGER)) {
+    x0 = Amd64Ctx->Rcx;
+    x1 = Amd64Ctx->Rdx;
+    x2 = Amd64Ctx->R8;
+    x3 = Amd64Ctx->R9;
+    x5 = Amd64Ctx->R11;
+    x8 = Amd64Ctx->Rax;
+    x19 = Amd64Ctx->R12;
+    x20 = Amd64Ctx->R13;
+    x21 = Amd64Ctx->R14;
+    x22 = Amd64Ctx->R15;
+    x25 = Amd64Ctx->Rsi;
+    x26 = Amd64Ctx->Rdi;
+    x27 = Amd64Ctx->Rbx;
+    fp = Amd64Ctx->Rbp;
+    if (Amd64Ctx->ContextFlags & CONTEXT_CONTROL) {
+      sp = Amd64Ctx->Rsp;
+    }
+  } else {
+    __wine_dbg_output( "ApplyJitStateToCpuForEcEntry: no thread state\n" );
+    return;
+  }
+
+  if (!sp) {
+    __asm__ volatile( "mov %0, sp" : "=r"( sp ) );
+  }
+
+  {
+    char buf[128];
+    snprintf( buf, sizeof(buf), "ApplyJit rcx=%llx rdx=%llx r8=%llx\n",
+              (unsigned long long)x0, (unsigned long long)x1, (unsigned long long)x2 );
+    __wine_dbg_output( buf );
+  }
+
+  __asm__ volatile("mov x0, %0\n\t"
+                   "mov x1, %1\n\t"
+                   "mov x2, %2\n\t"
+                   "mov x3, %3\n"
+                   : : "r"(x0), "r"(x1), "r"(x2), "r"(x3)
+                   : "x0", "x1", "x2", "x3");
+  __asm__ volatile("mov x4, %0\n\t"
+                   "mov x5, %1\n\t"
+                   "mov x8, %2\n\t"
+                   "mov x19, %3\n"
+                   : : "r"(sp), "r"(x5), "r"(x8), "r"(x19)
+                   : "x4", "x5", "x8", "x19");
+  __asm__ volatile("mov x20, %0\n\t"
+                   "mov x21, %1\n\t"
+                   "mov x22, %2\n\t"
+                   "mov x25, %3\n"
+                   : : "r"(x20), "r"(x21), "r"(x22), "r"(x25)
+                   : "x20", "x21", "x22", "x25");
+  __asm__ volatile("mov x26, %0\n\t"
+                   "mov x27, %1\n\t"
+                   "mov x29, %2\n"
+                   : : "r"(x26), "r"(x27), "r"(fp)
+                   : "x26", "x27", "x29");
+}
+
+extern "C" void SyncThreadContext(CONTEXT* Context) {
+  // TEB first: hybrid ProcessPending import can clobber x18; wine-apple needs tpidr/x18.
+  FEXSyncTebX18();
+#if FEX_ON_WINE_APPLE
+  // Full LoadStateFromECContext (XMM/segments/EFlags via CTX vtable) faults under
+  // wine-apple (gate el addr 0x100001 in SetXMM). Minimal integer+control only.
+  if (!Context) {
+    return;
+  }
+  const auto CPUArea = GetCPUArea();
+  if (!CPUArea.valid()) {
+    return;
+  }
+  auto* Thread = CPUArea.ThreadState();
+  if (!Thread || !Thread->CurrentFrame) {
+    return;
+  }
+  auto& State = Thread->CurrentFrame->State;
+  if ((Context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
+    State.gregs[FEXCore::X86State::REG_RAX] = Context->Rax;
+    State.gregs[FEXCore::X86State::REG_RCX] = Context->Rcx;
+    State.gregs[FEXCore::X86State::REG_RDX] = Context->Rdx;
+    State.gregs[FEXCore::X86State::REG_RBX] = Context->Rbx;
+    State.gregs[FEXCore::X86State::REG_RSI] = Context->Rsi;
+    State.gregs[FEXCore::X86State::REG_RDI] = Context->Rdi;
+    State.gregs[FEXCore::X86State::REG_R8] = Context->R8;
+    State.gregs[FEXCore::X86State::REG_R9] = Context->R9;
+    State.gregs[FEXCore::X86State::REG_R10] = Context->R10;
+    State.gregs[FEXCore::X86State::REG_R11] = Context->R11;
+    State.gregs[FEXCore::X86State::REG_R12] = Context->R12;
+    State.gregs[FEXCore::X86State::REG_R13] = Context->R13;
+    State.gregs[FEXCore::X86State::REG_R14] = Context->R14;
+    State.gregs[FEXCore::X86State::REG_R15] = Context->R15;
+  }
+  if ((Context->ContextFlags & CONTEXT_CONTROL) == CONTEXT_CONTROL) {
+    State.rip = Context->Rip;
+    State.gregs[FEXCore::X86State::REG_RSP] = Context->Rsp;
+    State.gregs[FEXCore::X86State::REG_RBP] = Context->Rbp;
+  }
+  // BeginSimulation reloads TEB from x18 after return; Darwin C clobbers x18.
+  FEXSyncTebX18();
+  return;
+#else
+  ProcessPendingCrossProcessEmulatorWork();
+  const auto CPUArea = GetCPUArea();
+  auto* FexCtx = GetFEXContext();
+  if (!Context || !FexCtx || !CPUArea.valid()) {
+    return;
+  }
+  auto* Thread = CPUArea.ThreadState();
+  if (!Thread || !Thread->CurrentFrame) {
+    return;
+  }
   // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
   // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
   static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
                                                (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
                                                (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
 
-  uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+  uint32_t StateEFlags = FexCtx->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
   Exception::LoadStateFromECContext(Thread, *Context);
+#endif
 }
 
 NTSTATUS ProcessInit() {
   InitSyscalls();
+#if FEX_ON_WINE_APPLE && defined(FEX_DEBUG_PROCESSINIT_STAGES)
+  // Kept for bisect only — do NOT enable in normal builds (skips ThreadInit).
+  return STATUS_SUCCESS;
+#endif
 
+#if FEX_ON_WINE_APPLE
+  // Capture TEB once before any Darwin SVC. Re-resolving after write(2) can see
+  // tpidr residue (0x1002/0x1003) and permanently lose the real TEB.
+  const uintptr_t ProcessSavedTeb = FEXWineAppleSaveTeb();
+  if (FEXIsPlausibleWineTeb(ProcessSavedTeb)) {
+    FEXWineAppleRestoreTeb(ProcessSavedTeb);
+  }
+  // Host write(2) only — __wine_dbg_output can fault this early (c000001d in ntdll).
+  auto FEXPiLog = [ProcessSavedTeb](const char* Msg) {
+    const size_t Len = strlen(Msg);
+    register uint64_t x0 __asm__("x0") = 2; /* stderr */
+    register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+    register uint64_t x2 __asm__("x2") = static_cast<uint64_t>(Len);
+    register uint64_t x16 __asm__("x16") = 4; /* SYS_write */
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+    FEXWineAppleRestoreTeb(ProcessSavedTeb);
+  };
+  FEXPiLog("FEX ProcessInit: after InitSyscalls\n");
+  // Skip Config::Initialize (MetaLayer/map faults early). GetConv null-checks Meta
+  // and Getters use compile-time defaults. Set after context exists if needed.
+
+  FEXPiLog("FEX ProcessInit: before FetchHostFeatures\n");
+  const auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeaturesWineApple();
+  FEXPiLog("FEX ProcessInit: after FetchHostFeatures\n");
+  FEXPiLog("FEX ProcessInit: before CreateNewContext\n");
+  // Do not assign file-scope CTX (RO .rdata on 16k pages). Stack raw pointer only this gate.
+  FEXCore::Context::Context* WineAppleCTX {};
+  {
+    auto Tmp = FEXCore::Context::Context::CreateNewContext(HostFeatures);
+    WineAppleCTX = Tmp.release();
+  }
+  if (!WineAppleCTX) {
+    FEXPiLog("FEX ProcessInit: CreateNewContext FAILED\n");
+    return STATUS_NO_MEMORY;
+  }
+  FEXPiLog("FEX ProcessInit: after CreateNewContext\n");
+  // No function-local statics (magic-static __cxa_guard → c000001d). Host-bump + placement-new.
+  {
+    void* SigMem = FEXCore::Allocator::aligned_alloc(alignof(FEX::DummyHandlers::DummySignalDelegator),
+                                                     sizeof(FEX::DummyHandlers::DummySignalDelegator));
+    void* SysMem = FEXCore::Allocator::aligned_alloc(alignof(Exception::ECSyscallHandler), sizeof(Exception::ECSyscallHandler));
+    if (!SigMem || !SysMem) {
+      FEXPiLog("FEX ProcessInit: handler alloc FAILED\n");
+      return STATUS_NO_MEMORY;
+    }
+    auto* BootstrapSignalDelegator = ::new (SigMem) FEX::DummyHandlers::DummySignalDelegator();
+    FEXPiLog("FEX ProcessInit: after SignalDelegator ctor\n");
+    auto* BootstrapSyscallHandler = ::new (SysMem) Exception::ECSyscallHandler();
+    FEXPiLog("FEX ProcessInit: after SyscallHandler ctor\n");
+    WineAppleCTX->SetSignalDelegator(BootstrapSignalDelegator);
+    WineAppleCTX->SetSyscallHandler(BootstrapSyscallHandler);
+  }
+  FEXPiLog("FEX ProcessInit: before InitCore\n");
+  WineAppleCTX->InitCore();
+  FEXPiLog("FEX ProcessInit: after InitCore\n");
+
+  // Stash for ThreadInit (file-scope CTX unique_ptr is RO .rdata — unusable).
+  FEXCore::Allocator::SetWineAppleContext(WineAppleCTX);
+  FEXPiLog("FEX ProcessInit: after SetWineAppleContext\n");
+
+  // Skip InitCRTProcess / full FinishWineApple (file-scope CTX + make_unique).
+  // jul10ai: pre-create slab-backed x86 ret + host ARM64 stub (no PE global writes).
+  if (FEXCore::Allocator::GetOrCreateX64ReturnInstr()) {
+    FEXPiLog("FEX ProcessInit: X64ReturnInstr slab OK\n");
+  } else {
+    FEXPiLog("FEX ProcessInit: X64ReturnInstr slab FAIL\n");
+  }
+  if (FEXCore::Allocator::GetOrCreateWineAppleHostRetStub()) {
+    FEXPiLog("FEX ProcessInit: HostRetStub OK\n");
+  }
+  FEXPiLog("FEX ProcessInit: before ThreadInit\n");
+  const NTSTATUS Ti = ThreadInit();
+  FEXPiLog("FEX ProcessInit: after ThreadInit\n");
+  return Ti;
+#else
   FEX::Windows::InitCRTProcess();
+  const auto NtDll = GetModuleHandle("ntdll.dll");
+  const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
+
   const auto ExecutableName = FEX::Windows::BaseName(FEX::Windows::GetExecutableFilePath());
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
-
-  __wine_dbg_output("starting FEX based libarm64ecfex.dll\n");
-
   FEXCore::Profiler::Init("", "");
 
   SignalDelegator = fextl::make_unique<FEX::DummyHandlers::DummySignalDelegator>();
   SyscallHandler = fextl::make_unique<Exception::ECSyscallHandler>();
 
-  const auto NtDll = GetModuleHandle("ntdll.dll");
-  const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
   OvercommitTracker.emplace(IsWine);
-
   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
-
   FEX::Windows::Allocator::SetupHooks(NtDll);
 
   {
@@ -610,15 +1523,14 @@ NTSTATUS ProcessInit() {
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
+
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
 
-  auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
-  HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
-
+  const auto MainModule = reinterpret_cast<uintptr_t>(reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress);
+  HandleImageMap(MainModule, true);
   HandleImageMap(NtDllBase);
-
   CPUFeatures.emplace(*CTX);
 
   X64ReturnInstr = ::VirtualAlloc(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -627,7 +1539,7 @@ NTSTATUS ProcessInit() {
   *reinterpret_cast<uint8_t*>(X64ReturnInstr) = 0xc3;
 
   const uintptr_t KiUserExceptionDispatcherFFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "KiUserExceptionDispatcher"));
-  Exception::KiUserExceptionDispatcher = NtDllRedirectionLUT[KiUserExceptionDispatcherFFS - NtDllBase] + NtDllBase;
+  Exception::SetKiUserExceptionDispatcher(NtDllRedirectionLUT[KiUserExceptionDispatcherFFS - NtDllBase] + NtDllBase);
 
   FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
   if (TSOEnabled()) {
@@ -652,6 +1564,7 @@ NTSTATUS ProcessInit() {
   }
 
   return STATUS_SUCCESS;
+#endif
 }
 
 void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
@@ -663,12 +1576,20 @@ private:
 public:
   ScopedCallbackDisable() {
     const auto CPUArea = GetCPUArea();
+    if (!CPUArea.valid()) {
+      Prev = false;
+      return;
+    }
     Prev = CPUArea.Area->InSyscallCallback;
     CPUArea.Area->InSyscallCallback = true;
   }
 
   ~ScopedCallbackDisable() {
-    GetCPUArea().Area->InSyscallCallback = Prev;
+    const auto CPUArea = GetCPUArea();
+    if (!CPUArea.valid()) {
+      return;
+    }
+    CPUArea.Area->InSyscallCallback = Prev;
   }
 };
 
@@ -753,6 +1674,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 }
 
 NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+  FEXSyncTebX18();
   bool Cont {};
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
@@ -823,6 +1745,17 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
     return;
   }
 
+#if FEX_ON_WINE_APPLE
+  // Wine ntdll hybrid metadata patching calls NtProtectVirtualMemory synchronously;
+  // invalidation here can recurse through arm64x_check_call during bring-up.
+  (void)Address;
+  (void)Size;
+  (void)NewProt;
+  (void)After;
+  (void)Status;
+  return;
+#endif
+
   if (!After) {
     ThreadCreationMutex.lock();
   } else {
@@ -837,6 +1770,18 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
   if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
     return STATUS_SUCCESS;
   }
+
+#if FEX_ON_WINE_APPLE
+  // Defer image tracking until loader_init completes; HandleImageMap during
+  // kernel32 bring-up can recurse through hybrid thunks / incomplete IATs.
+  (void)Unk1;
+  (void)Address;
+  (void)Unk2;
+  (void)Size;
+  (void)AllocType;
+  (void)Prot;
+  return STATUS_SUCCESS;
+#endif
 
   {
     std::scoped_lock Lock(ThreadCreationMutex);
@@ -916,20 +1861,106 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
 }
 
 NTSTATUS ThreadInit() {
+#if FEX_ON_WINE_APPLE
+  // Capture TEB before any Darwin SVC (write/mmap clobber tpidr/x18).
+  uintptr_t SavedTeb = FEXWineAppleSaveTeb();
+  if (!FEXIsPlausibleWineTeb(SavedTeb)) {
+    // Last chance after ProcessInit SVC noise — never deref junk (0x1003+0x1788).
+    SavedTeb = FEXResolveWineTeb();
+  }
+  if (!FEXIsPlausibleWineTeb(SavedTeb)) {
+    return STATUS_UNSUCCESSFUL;
+  }
+  FEXWineAppleRestoreTeb(SavedTeb);
+  // Host-mmap slab stash for BeginSimulation when tpidr/x18 are wiped after process_attach.
+  FEXSetLastGoodTeb(SavedTeb);
+  auto TiLog = [SavedTeb](const char* Msg) {
+    size_t Len = 0;
+    while (Msg[Len]) {
+      ++Len;
+    }
+    register uint64_t x0 __asm__("x0") = 2;
+    register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+    register uint64_t x2 __asm__("x2") = static_cast<uint64_t>(Len);
+    register uint64_t x16 __asm__("x16") = 4;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+    FEXWineAppleRestoreTeb(SavedTeb);
+  };
+  TiLog("FEX ThreadInit: enter\n");
+  // Skip ThreadCreationMutex / InitCRTThread / Threads map — PE BSS / CRT hazards.
+  // Build CPUArea from SavedTeb — do not re-read clobbered tpidr via GetCPUArea().
+  ThreadCPUArea CPUArea {reinterpret_cast<_TEB*>(SavedTeb)};
+  if (!CPUArea.Area) {
+    TiLog("FEX ThreadInit: no CHPE CPU area\n");
+    return STATUS_UNSUCCESSFUL;
+  }
+  FEXCore::Allocator::SetWineAppleCpuArea(CPUArea.Area);
+  {
+    const bool TebOk = reinterpret_cast<uintptr_t>(FEXCore::Allocator::GetWineAppleLastGoodTeb()) == SavedTeb;
+    const bool AreaOk = FEXCore::Allocator::GetWineAppleCpuArea() == CPUArea.Area;
+    TiLog(TebOk && AreaOk ? "FEX ThreadInit: slab TEB+CpuArea OK\n" : "FEX ThreadInit: slab TEB+CpuArea FAIL\n");
+  }
+  TiLog("FEX ThreadInit: after GetCPUArea\n");
+#else
   std::scoped_lock Lock(ThreadCreationMutex);
   FEX::Windows::InitCRTThread();
   const auto CPUArea = GetCPUArea();
+  if (!CPUArea.Area) {
+    return STATUS_UNSUCCESSFUL;
+  }
+#endif
 
   static constexpr size_t EmulatorStackSize = 0x40000;
+#if FEX_ON_WINE_APPLE
+  // Use Allocator VirtualAlloc (HostMmap+TEB restore) — not a separate SVC path.
+  const uint64_t EmulatorStack =
+    reinterpret_cast<uint64_t>(FEXCore::Allocator::VirtualAlloc(EmulatorStackSize, false, true));
+  if (!EmulatorStack) {
+    TiLog("FEX ThreadInit: emulator stack mmap failed\n");
+    return STATUS_NO_MEMORY;
+  }
+  TiLog("FEX ThreadInit: after emulator stack\n");
+#else
   const uint64_t EmulatorStack = reinterpret_cast<uint64_t>(::VirtualAlloc(nullptr, EmulatorStackSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+#endif
   CPUArea.EmulatorStackLimit() = EmulatorStack;
   CPUArea.EmulatorStackBase() = EmulatorStack + EmulatorStackSize;
 
+#if FEX_ON_WINE_APPLE
+  auto* Ctx = static_cast<FEXCore::Context::Context*>(FEXCore::Allocator::GetWineAppleContext());
+  if (!Ctx) {
+    TiLog("FEX ThreadInit: no WineAppleCTX\n");
+    return STATUS_UNSUCCESSFUL;
+  }
+  TiLog("FEX ThreadInit: before CreateThread\n");
+  auto* Thread = Ctx->CreateThread(0, 0);
+  TiLog("FEX ThreadInit: after CreateThread\n");
+#else
   auto* Thread = CTX->CreateThread(0, 0);
+#endif
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;
+#if FEX_ON_WINE_APPLE
+  TiLog("FEX ThreadInit: before GDT alloc\n");
+  using GdtSeg = FEXCore::Core::CPUState::gdt_segment;
+  constexpr size_t GdtBytes = sizeof(GdtSeg) * 32;
+  void* GdtMem = FEXCore::Allocator::aligned_alloc(alignof(GdtSeg), GdtBytes);
+  if (!GdtMem) {
+    TiLog("FEX ThreadInit: GDT alloc FAILED\n");
+    return STATUS_NO_MEMORY;
+  }
+  {
+    volatile unsigned char* B = static_cast<volatile unsigned char*>(GdtMem);
+    for (size_t I = 0; I < GdtBytes; ++I) {
+      B[I] = 0;
+    }
+  }
+  auto* NewSegments = static_cast<GdtSeg*>(GdtMem);
+  TiLog("FEX ThreadInit: after GDT alloc\n");
+#else
   auto NewSegments = new FEXCore::Core::CPUState::gdt_segment[32];
+#endif
 
   // Setup initial code-segment GDT
   auto& GDT = NewSegments[FEXCore::Core::CPUState::DEFAULT_USER_CS];
@@ -945,7 +1976,21 @@ NTSTATUS ThreadInit() {
   Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
 
+#if FEX_ON_WINE_APPLE
+  TiLog("FEX ThreadInit: before callret mmap\n");
+  // Host 16K pages; use Allocator VirtualAlloc for TEB-safe Darwin mmap.
+  constexpr size_t CRS = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+  constexpr size_t Guard = FEX_WINE_APPLE_PAGE_SIZE;
+  void* CrsAlloc = FEXCore::Allocator::VirtualAlloc(CRS + 2 * Guard, false, true);
+  if (!CrsAlloc) {
+    TiLog("FEX ThreadInit: callret stack mmap failed\n");
+    return STATUS_NO_MEMORY;
+  }
+  Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CrsAlloc) + Guard);
+  TiLog("FEX ThreadInit: after callret mmap\n");
+#else
   FEX::Windows::CallRetStack::InitializeThread(Thread);
+#endif
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
   CPUArea.StateFrame() = Thread->CurrentFrame;
 
@@ -955,6 +2000,26 @@ NTSTATUS ThreadInit() {
   uint64_t EnterECFillSRA = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterECFillSRA;
   CPUArea.DispatcherLoopTopEnterECFillSRA() = EnterECFillSRA;
 
+#if FEX_ON_WINE_APPLE
+  // Gate lb: AbsoluteLoopTopEnterEC is ret-only on wine-apple; FillSRA still
+  // enters LoopTop+CompileBlock (RX dispatcher code). Publish FillSRA for
+  // WineAppleEnterEC; keep PE-text EnterEC stub on [2]. BeginSim bare-br unchanged.
+  {
+    WineAppleRealFillSRA = EnterECFillSRA;
+    const uint64_t Stub = reinterpret_cast<uint64_t>(&WineAppleEnterEC);
+    CPUArea.DispatcherLoopTopEnterEC() = Stub;
+    Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC = Stub;
+    /* EmulatorData[3] remains real FillSRA (set above). */
+    TiLog("FEX ThreadInit: WineAppleEnterEC→FillSRA LoopTop (lb)\n");
+  }
+  // jul10ah: field-by-field ContextAmd64 + light LoadState (no aggregate brace-init /
+  // no float memcpy / no file-scope CTX). Aggregate assign → c000001d previously.
+  // callret/gs published with EmulatorData at end (no mid-init hybrid risk).
+  Frame->State.callret_sp = reinterpret_cast<uint64_t>(Thread->CallRetStackBase) + CRS / 4;
+  Frame->State.gs_cached = SavedTeb;
+  Frame->State.gs_idx = 0x2b;
+  TiLog("FEX ThreadInit: gs/callret set\n");
+#else
   CPUArea.ContextAmd64() = {.ContextFlags = CONTEXT_CONTROL | CONTEXT_SEGMENTS | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT,
                             .AMD64_SegCs = (FEXCore::Core::CPUState::DEFAULT_USER_CS << 3) | 3,
                             .AMD64_SegDs = 0x2b,
@@ -967,9 +2032,28 @@ NTSTATUS ThreadInit() {
                             .AMD64_MxCsr_copy = 0x1f80,
                             .AMD64_ControlWord = 0x27f};
   Exception::LoadStateFromECContext(Thread, CPUArea.ContextAmd64().AMD64_Context);
+#endif
 
+#if FEX_ON_WINE_APPLE
+  // Host-bump FrontendThreadData — no operator new / memset.
+  {
+    void* Fp = FEXCore::Allocator::aligned_alloc(alignof(FrontendThreadData), sizeof(FrontendThreadData));
+    if (!Fp) {
+      TiLog("FEX ThreadInit: FrontendPtr alloc FAILED\n");
+      return STATUS_NO_MEMORY;
+    }
+    volatile unsigned char* B = static_cast<volatile unsigned char*>(Fp);
+    for (size_t I = 0; I < sizeof(FrontendThreadData); ++I) {
+      B[I] = 0;
+    }
+    Thread->FrontendPtr = Fp;
+  }
+  TiLog("FEX ThreadInit: FrontendPtr ok\n");
+#else
   Thread->FrontendPtr = new FrontendThreadData();
+#endif
 
+#if !FEX_ON_WINE_APPLE
   {
     auto ThreadTID = GetCurrentThreadId();
     Threads.emplace(ThreadTID, Thread);
@@ -977,9 +2061,16 @@ NTSTATUS ThreadInit() {
       Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
     }
   }
+#endif
 
+  // Publish EmulatorData LAST — once set, Darwin SVC / hybrid return may enter
+  // EnterEC. No TiLog (svc) after this point.
+  CPUArea.StateFrame() = Frame;
   CPUArea.ThreadState() = Thread;
   CPUArea.Area->SuspendDoorbell = reinterpret_cast<ULONG*>(&Thread->CurrentFrame->SuspendDoorbell);
+#if FEX_ON_WINE_APPLE
+  FEXWineAppleRestoreTeb(SavedTeb);
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -1030,9 +2121,25 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
   // GDT and LDT are mirrored, only free one.
   delete[] ThreadState->CurrentFrame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT];
 
+#if FEX_ON_WINE_APPLE
+  {
+    constexpr size_t CRS = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+    constexpr size_t Guard = FEX_WINE_APPLE_PAGE_SIZE;
+    if (ThreadState->CallRetStackBase) {
+      void* Base = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(ThreadState->CallRetStackBase) - Guard);
+      FEXWineAppleMunmap(Base, CRS + 2 * Guard);
+      ThreadState->CallRetStackBase = nullptr;
+    }
+  }
+#else
   FEX::Windows::CallRetStack::DestroyThread(ThreadState);
+#endif
   CTX->DestroyThread(ThreadState);
+#if FEX_ON_WINE_APPLE
+  FEXWineAppleMunmap(reinterpret_cast<void*>(CPUArea.EmulatorStackLimit()), 0x40000);
+#else
   ::VirtualFree(reinterpret_cast<void*>(CPUArea.EmulatorStackLimit()), 0, MEM_RELEASE);
+#endif
   if (ThreadTID == GetCurrentThreadId()) {
     FEX::Windows::DeinitCRTThread();
   }
@@ -1041,9 +2148,15 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
 }
 
 BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT Feature) {
+  if (!CPUFeatures) {
+    return FALSE;
+  }
   return CPUFeatures->IsFeaturePresent(Feature) ? TRUE : FALSE;
 }
 
 void UpdateProcessorInformation(SYSTEM_CPU_INFORMATION* Info) {
+  if (!CPUFeatures) {
+    return;
+  }
   CPUFeatures->UpdateInformation(Info);
 }

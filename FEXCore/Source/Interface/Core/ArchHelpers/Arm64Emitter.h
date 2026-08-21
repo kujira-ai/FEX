@@ -149,6 +149,9 @@ protected:
     uint32_t FPRFillMask {~0U};
     bool FPRs {true};
     bool NZCV {true};
+    // wine-apple EnterECFillSRA: x17 is CPUArea. Do not ldr [x18,#0x1788] as a
+    // TEB pointer — lt x18 is CPUArea-0x1788, so that load is InSimulation (1).
+    bool ECStateFromCpuArea {false};
   };
 
   void SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options);

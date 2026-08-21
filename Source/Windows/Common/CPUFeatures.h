@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#ifndef FEX_ON_WINE_APPLE
+#define FEX_ON_WINE_APPLE 0
+#endif
 
 #include <windef.h>
 #include <winternl.h>
@@ -17,6 +20,9 @@ namespace FEX::Windows {
 class CPUFeatures {
 public:
   static FEXCore::HostFeatures FetchHostFeatures(bool IsWine);
+#if FEX_ON_WINE_APPLE
+  static FEXCore::HostFeatures FetchHostFeaturesWineApple();
+#endif
 
   CPUFeatures(FEXCore::Context::Context& CTX);
 

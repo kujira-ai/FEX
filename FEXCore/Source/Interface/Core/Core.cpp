@@ -78,15 +78,89 @@ $end_info$
 #include <xxhash.h>
 
 namespace FEXCore::Context {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+namespace {
+void FEXCtorLog(const char* Msg) {
+  size_t Len = 0;
+  while (Msg[Len]) {
+    ++Len;
+  }
+  uintptr_t SavedTeb {}, SavedX18 {};
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(SavedTeb) :: "memory");
+  __asm__ volatile("mov %0, x18" : "=r"(SavedX18));
+  register uint64_t x0 __asm__("x0") = 2;
+  register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+  register uint64_t x2 __asm__("x2") = static_cast<uint64_t>(Len);
+  register uint64_t x16 __asm__("x16") = 4;
+  __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+  uintptr_t Restore = SavedTeb;
+  if (Restore < 0x10000ull || (Restore & 0xFull)) {
+    Restore = SavedX18;
+  }
+  if (Restore >= 0x10000ull && !(Restore & 0xFull)) {
+    __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
+  }
+}
+} // namespace
+#endif
+
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Assign HostFeatures after bases construct (copy of Features was suspect).
+  : HostFeatures {}
+#else
   : HostFeatures {Features}
+#endif
   , CPUID {this}
   , CodeCache {*this} {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("ContextImpl: after CPUID+CodeCache\n");
+  // Scalar copy only — operator= on HostFeatures copies CPUMIDRs via
+  // fextl::vector (libc #memmove exit-thunk before JIT → c000001d).
+  HostFeatures.DCacheLineSize = Features.DCacheLineSize;
+  HostFeatures.ICacheLineSize = Features.ICacheLineSize;
+  HostFeatures.SupportsCacheMaintenanceOps = Features.SupportsCacheMaintenanceOps;
+  HostFeatures.SupportsAES = Features.SupportsAES;
+  HostFeatures.SupportsCRC = Features.SupportsCRC;
+  HostFeatures.SupportsCLZERO = Features.SupportsCLZERO;
+  HostFeatures.SupportsAtomics = Features.SupportsAtomics;
+  HostFeatures.SupportsRCPC = Features.SupportsRCPC;
+  HostFeatures.SupportsTSOImm9 = Features.SupportsTSOImm9;
+  HostFeatures.SupportsRAND = Features.SupportsRAND;
+  HostFeatures.SupportsAVX = Features.SupportsAVX;
+  HostFeatures.SupportsSVE128 = Features.SupportsSVE128;
+  HostFeatures.SupportsSVE256 = Features.SupportsSVE256;
+  HostFeatures.SupportsSHA = Features.SupportsSHA;
+  HostFeatures.SupportsPMULL_128Bit = Features.SupportsPMULL_128Bit;
+  HostFeatures.SupportsCSSC = Features.SupportsCSSC;
+  HostFeatures.SupportsFCMA = Features.SupportsFCMA;
+  HostFeatures.SupportsFlagM = Features.SupportsFlagM;
+  HostFeatures.SupportsFlagM2 = Features.SupportsFlagM2;
+  HostFeatures.SupportsRPRES = Features.SupportsRPRES;
+  HostFeatures.SupportsPreserveAllABI = Features.SupportsPreserveAllABI;
+  HostFeatures.SupportsAES256 = Features.SupportsAES256;
+  HostFeatures.SupportsSVEBitPerm = Features.SupportsSVEBitPerm;
+  HostFeatures.SupportsCPUIndexInTPIDRRO = Features.SupportsCPUIndexInTPIDRRO;
+  HostFeatures.SupportsFRINTTS = Features.SupportsFRINTTS;
+  HostFeatures.SupportsECV = Features.SupportsECV;
+  HostFeatures.SupportsWFXT = Features.SupportsWFXT;
+  HostFeatures.Supports3DNow = Features.Supports3DNow;
+  HostFeatures.SupportsSSE4a = Features.SupportsSSE4a;
+  HostFeatures.SupportsMOPS = Features.SupportsMOPS;
+  HostFeatures.SupportsAFP = Features.SupportsAFP;
+  HostFeatures.SupportsFloatExceptions = Features.SupportsFloatExceptions;
+  HostFeatures.IsInstCountCI = Features.IsInstCountCI;
+  // CPUMIDRs left empty (never push during ProcessInit).
+  FEXCtorLog("ContextImpl: after HostFeatures assign\n");
+#endif
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
   }
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("ContextImpl: skip Symbols/TSC for now\n");
+#else
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
     // Only initialize symbols file if enabled. Ensures we don't pollute /tmp with empty files.
     Symbols.InitFile();
@@ -100,9 +174,13 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
       ++Config.TSCScale;
     }
   }
+#endif
 
   // Track atomic TSO emulation configuration.
   UpdateAtomicTSOEmulationConfig();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("ContextImpl: ctor done\n");
+#endif
 }
 
 struct GetFrameBlockInfoResult {
@@ -342,11 +420,20 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
 }
 
 bool ContextImpl::InitCore() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("InitCore: enter\n");
+#endif
   // Initialize the CPU core signal handlers & DispatcherConfig
   Dispatcher = FEXCore::CPU::Dispatcher::Create(this);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("InitCore: after Dispatcher::Create\n");
+#endif
 
   // Set up the SignalDelegator config since core is initialized.
   SignalDelegation->SetConfig(Dispatcher->MakeSignalDelegatorConfig());
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("InitCore: after SetConfig\n");
+#endif
 
 #if defined(_WIN32) && !defined(ARCHITECTURE_arm64ec)
   // WOW64 always needs the interrupt fault check to be enabled.
@@ -358,6 +445,9 @@ bool ContextImpl::InitCore() {
     Config.NeedsPendingInterruptFaultCheck = true;
   }
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("InitCore: done\n");
+#endif
   return true;
 }
 
@@ -376,6 +466,31 @@ void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
 }
 
 void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Full compiler (make_unique/LookupCache maps/JIT) still exit-thunks. Host-alloc L1 only so
+  // STATE.L1Pointer is non-null (jul10ah) — empty L1 means FindBlock always misses, no fault.
+  FEXCtorLog("InitializeCompiler: L1 host alloc\n");
+  constexpr size_t L1Entries = 8 * 1024; // match LookupCache MIN_L1_ENTRIES
+  constexpr size_t EntrySize = 16;       // LookupCacheEntry {HostCode, GuestCode}
+  constexpr size_t L1Bytes = L1Entries * EntrySize;
+  void* L1 = FEXCore::Allocator::VirtualAlloc(L1Bytes, false, true);
+  if (L1) {
+    volatile unsigned char* B = static_cast<volatile unsigned char*>(L1);
+    for (size_t I = 0; I < L1Bytes; ++I) {
+      B[I] = 0;
+    }
+    Thread->CurrentFrame->State.L1Pointer = reinterpret_cast<uint64_t>(L1);
+    // Scaled mask as GetScaledL1PointerMask: (entries-1) << log2(EntrySize)
+    Thread->CurrentFrame->State.L1Mask = static_cast<uint64_t>(L1Entries - 1) * EntrySize;
+    FEXCtorLog("InitializeCompiler: L1 OK\n");
+  } else {
+    FEXCtorLog("InitializeCompiler: L1 alloc FAILED\n");
+  }
+  if (Dispatcher) {
+    Dispatcher->InitThreadPointers(Thread);
+  }
+  return;
+#else
   Thread->OpDispatcher = fextl::make_unique<FEXCore::IR::OpDispatchBuilder>(this);
   Thread->OpDispatcher->SetMultiblock(Config.Multiblock);
   Thread->LookupCache = fextl::make_unique<FEXCore::LookupCache>(this);
@@ -399,13 +514,46 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
   Thread->CPUBackend = FEXCore::CPU::CreateArm64JITCore(this, Thread);
 
   Thread->PassManager->Finalize();
+#endif
 }
 
 FEXCore::Core::InternalThreadState*
 ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXCore::Core::CPUState* NewThreadState) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("CreateThread: enter\n");
+  // No C++ ctor: large InternalThreadState construction uses #memset (exit-thunk).
+  // Hand-zero host-bump memory and poke const CurrentFrame/CTX fields.
+  const size_t Sz = sizeof(FEXCore::Core::InternalThreadState);
+  const size_t Al = alignof(FEXCore::Core::InternalThreadState);
+  void* Mem = FEXCore::Allocator::aligned_alloc(Al, Sz);
+  if (!Mem) {
+    FEXCtorLog("CreateThread: alloc FAILED\n");
+    return nullptr;
+  }
+  FEXCtorLog("CreateThread: after alloc\n");
+  {
+    // volatile: prevent libcall to #memset (ARM64EC exit-thunk before JIT).
+    volatile unsigned char* B = static_cast<volatile unsigned char*>(Mem);
+    for (size_t I = 0; I < Sz; ++I) {
+      B[I] = 0;
+    }
+  }
+  FEXCtorLog("CreateThread: after zero\n");
+  auto* Thread = static_cast<FEXCore::Core::InternalThreadState*>(Mem);
+  {
+    FEXCore::Core::CpuStateFrame* Frame = &Thread->BaseFrameState;
+    // Standard-layout: overwrite const pointer members without running ctor.
+    *reinterpret_cast<FEXCore::Core::CpuStateFrame**>(reinterpret_cast<char*>(Thread) +
+                                                      offsetof(FEXCore::Core::InternalThreadState, CurrentFrame)) = Frame;
+    *reinterpret_cast<FEXCore::Context::Context**>(reinterpret_cast<char*>(Thread) +
+                                                   offsetof(FEXCore::Core::InternalThreadState, CTX)) = this;
+  }
+  FEXCtorLog("CreateThread: after field poke\n");
+#else
   FEXCore::Core::InternalThreadState* Thread = new FEXCore::Core::InternalThreadState {
     .CTX = this,
   };
+#endif
   FEXCore::Allocator::VirtualName("FEXMem_ThreadState", Thread, sizeof(*Thread));
 
   Thread->CurrentFrame->State.gregs[X86State::REG_RSP] = StackPointer;
@@ -413,21 +561,37 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
 
   // Copy over the new thread state to the new object
   if (NewThreadState) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    auto* D = reinterpret_cast<unsigned char*>(&Thread->CurrentFrame->State);
+    const auto* S = reinterpret_cast<const unsigned char*>(NewThreadState);
+    for (size_t I = 0; I < sizeof(FEXCore::Core::CPUState); ++I) {
+      D[I] = S[I];
+    }
+#else
     memcpy(&Thread->CurrentFrame->State, NewThreadState, sizeof(FEXCore::Core::CPUState));
+#endif
   }
 
   // Set up the thread manager state
   Thread->CurrentFrame->Thread = Thread;
 
   InitializeCompiler(Thread);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("CreateThread: after InitializeCompiler\n");
+#endif
 
   Thread->CurrentFrame->State.DeferredSignalRefCount.Store(0);
 
+#if !(defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE)
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
     // Allocate a JIT symbol buffer only if enabled.
     Thread->SymbolBuffer = JITSymbols::AllocateBuffer();
   }
+#endif
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCtorLog("CreateThread: done\n");
+#endif
   return Thread;
 }
 
@@ -818,6 +982,19 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 }
 
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // No LookupCache/CPUBackend yet — seed L1 with host ret stub (same as EnterEC miss).
+  (void)MaxInst;
+  void* Stub = FEXCore::Allocator::GetOrCreateWineAppleHostRetStub();
+  const uint64_t Host = Stub ? reinterpret_cast<uint64_t>(Stub) : 0;
+  if (Frame && Frame->State.L1Pointer && Host) {
+    const uint64_t Off = GuestRIP & Frame->State.L1Mask;
+    auto* E = reinterpret_cast<volatile uint64_t*>(Frame->State.L1Pointer + Off);
+    E[0] = Host;
+    E[1] = GuestRIP;
+  }
+  return Host;
+#else
   auto Thread = Frame->Thread;
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
@@ -918,6 +1095,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   return (uintptr_t)CodePtr;
+#endif
 }
 
 uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {

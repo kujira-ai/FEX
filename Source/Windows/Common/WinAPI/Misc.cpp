@@ -63,9 +63,13 @@ DLLEXPORT_FUNC(void, GetSystemInfo, (LPSYSTEM_INFO lpSystemInfo)) {
     return;
   }
 
+  ULONG PageSize = Info.PhysicalPageSize;
+  if (PageSize < 16384)
+    PageSize = 16384;
+
   *lpSystemInfo = SYSTEM_INFO {
     .wProcessorArchitecture = PROCESSOR_ARCHITECTURE_ARM64,
-    .dwPageSize = Info.PhysicalPageSize,
+    .dwPageSize = PageSize,
     .lpMinimumApplicationAddress = reinterpret_cast<void*>(Info.LowestUserAddress),
     .lpMaximumApplicationAddress = reinterpret_cast<void*>(Info.HighestUserAddress),
     .dwActiveProcessorMask = Info.ActiveProcessors,

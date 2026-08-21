@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT
+#ifndef FEX_ON_WINE_APPLE
+#define FEX_ON_WINE_APPLE 0
+#endif
 
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/TypeDefines.h>
@@ -17,6 +20,7 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
 
+#if !FEX_ON_WINE_APPLE
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = 0;
 
@@ -28,6 +32,7 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
 
     Address = BaseAddress + Info.RegionSize;
   }
+#endif
 }
 
 void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot) {

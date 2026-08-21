@@ -33,6 +33,7 @@ set(SRCS
   Interface/Core/OpcodeDispatcher.cpp
   Interface/Core/ArchHelpers/Arm64Emitter.cpp
   Interface/Core/Dispatcher/Dispatcher.cpp
+  Interface/Core/WineAppleDummyFexcoreGrowth.cpp
   Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp
   Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp
   Interface/Core/JIT/JIT.cpp
@@ -285,6 +286,19 @@ function(AddLibrary Name Type)
 endfunction()
 
 AddObject(${PROJECT_NAME}_object)
+if (CMAKE_HOST_APPLE)
+  # Wine ARM64EC cross-build on macOS: avoid privileged MRS / host-unsafe paths.
+  target_compile_definitions(${PROJECT_NAME}_object PRIVATE FEX_ON_WINE_APPLE=1)
+  target_compile_definitions(FEXCore_Base PRIVATE FEX_ON_WINE_APPLE=1)
+  # Prove PE pin: FEXCore .text growth size (nops). 128 vs 256 left EnterEC RVA unchanged.
+  if (NOT DEFINED FEX_WINE_APPLE_DUMMY_NOPS)
+    set(FEX_WINE_APPLE_DUMMY_NOPS 256)
+  endif()
+  target_compile_definitions(${PROJECT_NAME}_object PRIVATE FEX_WINE_APPLE_DUMMY_NOPS=${FEX_WINE_APPLE_DUMMY_NOPS})
+  target_compile_options(${PROJECT_NAME}_object PRIVATE
+    -fno-function-sections
+    "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/Interface/Core/WineAppleFexcoreSec.h")
+endif()
 AddLibrary(${PROJECT_NAME} STATIC)
 AddLibrary(${PROJECT_NAME}_shared SHARED)
 
@@ -297,9 +311,14 @@ endif()
 # Meta-library to link jemalloc libraries enabled in the build configuration.
 # Only needed for targets that run emulation. For others, use JemallocDummy.
 add_library(JemallocLibs STATIC Utils/AllocatorHooks.cpp)
+target_include_directories(JemallocLibs PRIVATE "${PROJECT_SOURCE_DIR}/include/")
 if (ENABLE_FEX_ALLOCATOR)
   target_compile_definitions(JemallocLibs PRIVATE ENABLE_FEX_ALLOCATOR=1)
   target_link_libraries(JemallocLibs PUBLIC rpmalloc)
+endif()
+# Cross-build on Apple for Wine ARM64EC: Darwin host mmap bump instead of rpmalloc/VirtualAlloc.
+if (CMAKE_HOST_APPLE)
+  target_compile_definitions(JemallocLibs PRIVATE FEX_ON_WINE_APPLE=1)
 endif()
 if (ENABLE_JEMALLOC_GLIBC_ALLOC)
   set_source_files_properties(Interface/HLE/Thunks/Thunks.cpp PROPERTIES COMPILE_DEFINITIONS ENABLE_JEMALLOC_GLIBC=1)

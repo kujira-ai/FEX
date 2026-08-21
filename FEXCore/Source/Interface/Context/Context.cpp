@@ -16,7 +16,45 @@
 
 namespace FEXCore::Context {
 fextl::unique_ptr<FEXCore::Context::Context> FEXCore::Context::Context::CreateNewContext(const FEXCore::HostFeatures& Features) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  auto HostWrite = [](const char* Msg) {
+    size_t Len = 0;
+    while (Msg[Len]) {
+      ++Len;
+    }
+    uintptr_t SavedTeb {}, SavedX18 {};
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(SavedTeb) :: "memory");
+    __asm__ volatile("mov %0, x18" : "=r"(SavedX18));
+    register uint64_t x0 __asm__("x0") = 2;
+    register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+    register uint64_t x2 __asm__("x2") = static_cast<uint64_t>(Len);
+    register uint64_t x16 __asm__("x16") = 4;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+    uintptr_t Restore = SavedTeb;
+    if (Restore < 0x10000ull || (Restore & 0xFull)) {
+      Restore = SavedX18;
+    }
+    if (Restore >= 0x10000ull && !(Restore & 0xFull)) {
+      __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
+    }
+  };
+  HostWrite("CreateNewContext: enter\n");
+  const size_t Sz = sizeof(FEXCore::Context::ContextImpl);
+  const size_t Al = alignof(FEXCore::Context::ContextImpl);
+  HostWrite("CreateNewContext: before aligned_alloc\n");
+  void* Mem = FEXCore::Allocator::aligned_alloc(Al, Sz);
+  if (!Mem) {
+    HostWrite("CreateNewContext: aligned_alloc FAILED\n");
+    return nullptr;
+  }
+  HostWrite("CreateNewContext: aligned_alloc OK\n");
+  HostWrite("CreateNewContext: before placement new\n");
+  auto* Obj = ::new (Mem) FEXCore::Context::ContextImpl(Features);
+  HostWrite("CreateNewContext: after placement new\n");
+  return fextl::unique_ptr<FEXCore::Context::Context>(Obj);
+#else
   return fextl::make_unique<FEXCore::Context::ContextImpl>(Features);
+#endif
 }
 
 void FEXCore::Context::ContextImpl::CompileRIP(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {

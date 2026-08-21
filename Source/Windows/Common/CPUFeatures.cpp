@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT
+#ifndef FEX_ON_WINE_APPLE
+#define FEX_ON_WINE_APPLE 0
+#endif
 
 #include "Common/CPUInfo.h"
 
@@ -84,6 +87,49 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine) {
   HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine;
   return HostFeatures;
 }
+
+#if FEX_ON_WINE_APPLE
+// macOS userspace under Wine: almost all MRS of sysregs (including CTR/DCZID from
+// ARM64EC PE) can surface as c000001d. Use a pure software Apple Silicon baseline.
+FEXCore::HostFeatures CPUFeatures::FetchHostFeaturesWineApple() {
+  FEXCore::HostFeatures HostFeatures {};
+  HostFeatures.DCacheLineSize = 64;
+  HostFeatures.ICacheLineSize = 64;
+  HostFeatures.SupportsCacheMaintenanceOps = false;
+  HostFeatures.SupportsAES = true;
+  HostFeatures.SupportsCRC = true;
+  HostFeatures.SupportsSHA = true;
+  HostFeatures.SupportsAtomics = true;
+  HostFeatures.SupportsRCPC = true;
+  HostFeatures.SupportsTSOImm9 = true;
+  HostFeatures.SupportsPMULL_128Bit = true;
+  HostFeatures.SupportsFlagM = true;
+  HostFeatures.SupportsFlagM2 = true;
+  HostFeatures.SupportsFRINTTS = true;
+  HostFeatures.SupportsFCMA = true;
+  HostFeatures.SupportsRAND = false;
+  HostFeatures.SupportsCSSC = false;
+  HostFeatures.SupportsRPRES = false;
+  HostFeatures.SupportsAFP = false;
+  HostFeatures.SupportsECV = false;
+  HostFeatures.SupportsWFXT = false;
+  HostFeatures.SupportsSVEBitPerm = false;
+  HostFeatures.SupportsSVE128 = false;
+  HostFeatures.SupportsSVE256 = false;
+  HostFeatures.SupportsMOPS = false;
+  HostFeatures.SupportsAVX = true;
+  HostFeatures.SupportsAES256 = true;
+  HostFeatures.SupportsPreserveAllABI = false;
+  HostFeatures.Supports3DNow = false;
+  HostFeatures.SupportsSSE4a = false;
+  HostFeatures.SupportsCPUIndexInTPIDRRO = false;
+  HostFeatures.SupportsFloatExceptions = false;
+  HostFeatures.SupportsCLZERO = true; // Apple DC ZVA is 64B
+  // Leave CPUMIDRs empty — SetupHostHybridFlag is patched to tolerate that.
+  // (push_back here still hit c000001d via vector growth on some builds.)
+  return HostFeatures;
+}
+#endif
 
 CPUFeatures::CPUFeatures(FEXCore::Context::Context& CTX) {
 #ifdef ARCHITECTURE_arm64ec

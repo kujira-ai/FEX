@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT
+#ifndef FEX_ON_WINE_APPLE
+#define FEX_ON_WINE_APPLE 0
+#endif
 #include <iterator>
 #include <windef.h>
 #include <winternl.h>
@@ -40,7 +43,9 @@ void RunFuncArray(TFuncIt Begin, TFuncIt End, TArgs... Args) {
 
 namespace FEX::Windows {
 void InitCRTProcess() {
+#if !FEX_ON_WINE_APPLE
   rpmalloc_initialize(nullptr);
+#endif
 
   auto GNUCtorBegin = &__CTOR_LIST__[1];
   auto GNUCtorEnd = GNUCtorBegin;
