@@ -126,11 +126,15 @@ uint32_t EncMovk(unsigned Rd, uint16_t Imm, unsigned Hw) {
   return 0xF2800000u | (Hw << 21) | (static_cast<uint32_t>(Imm) << 5) | Rd;
 }
 
-void EmitBrAbs(uint32_t* Out, size_t& N, unsigned Rd, uint64_t Abs) {
+void EmitMovAbs(uint32_t* Out, size_t& N, unsigned Rd, uint64_t Abs) {
   Out[N++] = EncMovz(Rd, static_cast<uint16_t>(Abs), 0);
   Out[N++] = EncMovk(Rd, static_cast<uint16_t>(Abs >> 16), 1);
   Out[N++] = EncMovk(Rd, static_cast<uint16_t>(Abs >> 32), 2);
   Out[N++] = EncMovk(Rd, static_cast<uint16_t>(Abs >> 48), 3);
+}
+
+void EmitBrAbs(uint32_t* Out, size_t& N, unsigned Rd, uint64_t Abs) {
+  EmitMovAbs(Out, N, Rd, Abs);
   Out[N++] = 0xD61F0000u | (Rd << 5);
 }
 
@@ -189,7 +193,7 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     B4 = P[4];
   }
 
-  uint32_t Words[16];
+  uint32_t Words[24];
   size_t N = 0;
   if (B0 == 0x90) {
     EmitRipAddBr(Words, N, 1, LoopTop);
@@ -228,6 +232,23 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
         Words[N++] = EncMovk(Rd, static_cast<uint16_t>(Imm >> 16), 1);
       }
       EmitRipAddBr(Words, N, 5, LoopTop);
+    }
+  } else if (B0 == 0xE8) {
+    // call rel32: push RIP+5, RIP = RIP+5+disp32, br LoopTop
+    const int32_t Disp = static_cast<int32_t>(static_cast<uint32_t>(B1) | (static_cast<uint32_t>(B2) << 8) |
+                                              (static_cast<uint32_t>(B3) << 16) | (static_cast<uint32_t>(B4) << 24));
+    const uint64_t Ret = GuestRIP + 5;
+    const uint64_t Tgt = Ret + static_cast<uint64_t>(static_cast<int64_t>(Disp));
+    Words[N++] = EncSubImm(23, 8);       // RSP -= 8
+    EmitMovAbs(Words, N, 10, Ret);       // x10 = return RIP
+    Words[N++] = 0xF90002EAu;            // str x10, [x23]
+    EmitMovAbs(Words, N, 10, Tgt);       // x10 = target
+    Words[N++] = 0xF9000F8Au;            // str x10, [x28, #24] RIP
+    if (LoopTop) {
+      EmitBrAbs(Words, N, 10, LoopTop);
+    } else {
+      Words[N++] = 0xAA1F03EBu;
+      Words[N++] = 0xF900017Fu;
     }
   }
 
