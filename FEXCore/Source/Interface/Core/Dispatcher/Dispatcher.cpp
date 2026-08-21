@@ -292,7 +292,7 @@ void Dispatcher::EmitDispatcher() {
 
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
   // wine-apple: LookupCache/L2 not built (InitializeCompiler is L1-only). Always
-  // miss → CompileBlock → HostRetStub (RX). Avoid null L2Pointer load after RX entry.
+  // miss → CompileBlock → WineAppleHost one-insn (RX).
   (void)b(&NoBlock);
 #else
   if (DisableL2Cache()) {

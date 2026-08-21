@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: MIT
+#include "Interface/Core/WineAppleHost.h"
+
+#include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
+
+#include <cstdint>
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+
+namespace FEX::WineApple {
+namespace {
+
+constexpr size_t kPage = 16384;
+constexpr uint64_t kMaxCache = 8;
+
+struct CacheEnt {
+  uint64_t Guest;
+  uint64_t Host;
+};
+
+struct Meta {
+  uint64_t NCache;
+  void* Unhandled;
+  CacheEnt Cache[kMaxCache];
+};
+
+bool PlausibleMeta(void* P) {
+  const auto U = reinterpret_cast<uintptr_t>(P);
+  if (U < 0x10000ull || (U & 0xFFFull) != 0) {
+    return false;
+  }
+  if ((U & 0xFFFFFFFFull) == 0 || U >= 0x0001'0000'0000'0000ull) {
+    return false;
+  }
+  return true;
+}
+
+Meta* GetMeta() {
+  static Meta* P {};
+  if (!PlausibleMeta(P)) {
+    void* Page = FEXCore::Allocator::VirtualAlloc(kPage, false, true);
+    if (!Page) {
+      return nullptr;
+    }
+    auto* M = static_cast<volatile unsigned char*>(Page);
+    for (size_t I = 0; I < sizeof(Meta); ++I) {
+      M[I] = 0;
+    }
+    P = static_cast<Meta*>(Page);
+  }
+  return P;
+}
+
+void FlushICache(void* Page, size_t Bytes) {
+  uintptr_t P = reinterpret_cast<uintptr_t>(Page) & ~63ull;
+  const uintptr_t E = reinterpret_cast<uintptr_t>(Page) + Bytes;
+  for (; P < E; P += 64) {
+    __asm__ volatile("dc cvau, %0" ::"r"(P) : "memory");
+  }
+  __asm__ volatile("dsb ish" ::: "memory");
+  P = reinterpret_cast<uintptr_t>(Page) & ~63ull;
+  for (; P < E; P += 64) {
+    __asm__ volatile("ic ivau, %0" ::"r"(P) : "memory");
+  }
+  __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+
+void* EmitRX(const uint32_t* Words, size_t NWords) {
+  void* Page = FEXCore::Allocator::VirtualAlloc(kPage, false, true);
+  if (!Page) {
+    return nullptr;
+  }
+  auto* W = static_cast<volatile uint32_t*>(Page);
+  for (size_t I = 0; I < NWords; ++I) {
+    W[I] = Words[I];
+  }
+  FlushICache(Page, NWords * 4);
+  (void)FEXCore::Allocator::VirtualProtect(Page, kPage,
+                                           FEXCore::Allocator::ProtectOptions::Read | FEXCore::Allocator::ProtectOptions::Exec);
+  return Page;
+}
+
+void* UnhandledFAR0() {
+  Meta* M = GetMeta();
+  if (!M) {
+    return nullptr;
+  }
+  if (M->Unhandled) {
+    return M->Unhandled;
+  }
+  const uint32_t Words[] = {
+    0xAA1F03EBu, // mov x11, xzr
+    0xF900017Fu, // str xzr, [x11]
+  };
+  M->Unhandled = EmitRX(Words, 2);
+  return M->Unhandled;
+}
+
+int SraXn(uint8_t PushOp) {
+  switch (PushOp) {
+  case 0x50: return 8;
+  case 0x51: return 0;
+  case 0x52: return 1;
+  case 0x53: return 27;
+  case 0x54: return 23;
+  case 0x55: return 29;
+  case 0x56: return 25;
+  case 0x57: return 26;
+  default: return -1;
+  }
+}
+
+uint32_t EncMovz(unsigned Rd, uint16_t Imm, unsigned Hw) {
+  return 0xD2800000u | (Hw << 21) | (static_cast<uint32_t>(Imm) << 5) | Rd;
+}
+uint32_t EncMovk(unsigned Rd, uint16_t Imm, unsigned Hw) {
+  return 0xF2800000u | (Hw << 21) | (static_cast<uint32_t>(Imm) << 5) | Rd;
+}
+
+void EmitBrAbs(uint32_t* Out, size_t& N, unsigned Rd, uint64_t Abs) {
+  Out[N++] = EncMovz(Rd, static_cast<uint16_t>(Abs), 0);
+  Out[N++] = EncMovk(Rd, static_cast<uint16_t>(Abs >> 16), 1);
+  Out[N++] = EncMovk(Rd, static_cast<uint16_t>(Abs >> 32), 2);
+  Out[N++] = EncMovk(Rd, static_cast<uint16_t>(Abs >> 48), 3);
+  Out[N++] = 0xD61F0000u | (Rd << 5);
+}
+
+void EmitRipAddBr(uint32_t* Out, size_t& N, uint32_t Delta, uint64_t LoopTop) {
+  Out[N++] = 0xF9400F8Au; // ldr x10, [x28, #24] RIP
+  Out[N++] = 0x91000000u | (Delta << 10) | (10u << 5) | 10u;
+  Out[N++] = 0xF9000F8Au;
+  if (LoopTop) {
+    EmitBrAbs(Out, N, 10, LoopTop);
+  } else {
+    Out[N++] = 0xAA1F03EBu;
+    Out[N++] = 0xF900017Fu;
+  }
+}
+
+void SeedL1(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t Host) {
+  if (!Frame || !Frame->State.L1Pointer || !Host) {
+    return;
+  }
+  const uint64_t Off = GuestRIP & Frame->State.L1Mask;
+  auto* E = reinterpret_cast<volatile uint64_t*>(Frame->State.L1Pointer + Off);
+  E[0] = Host;
+  E[1] = GuestRIP;
+}
+
+} // namespace
+
+void Ensure() {
+  (void)UnhandledFAR0();
+}
+
+uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  const uint64_t LoopTop = Frame ? Frame->Pointers.DispatcherLoopTop : 0;
+  if (GuestRIP < 0x10000ull) {
+    void* U = UnhandledFAR0();
+    return U ? reinterpret_cast<uintptr_t>(U) : 0;
+  }
+  Meta* M = GetMeta();
+  if (!M) {
+    return 0;
+  }
+  for (uint64_t I = 0; I < M->NCache && I < kMaxCache; ++I) {
+    if (M->Cache[I].Guest == GuestRIP && M->Cache[I].Host) {
+      SeedL1(Frame, GuestRIP, M->Cache[I].Host);
+      return M->Cache[I].Host;
+    }
+  }
+
+  uint8_t B0 = 0, B1 = 0;
+  {
+    const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
+    B0 = P[0];
+    B1 = P[1];
+  }
+
+  uint32_t Words[16];
+  size_t N = 0;
+  if (B0 == 0x90) {
+    EmitRipAddBr(Words, N, 1, LoopTop);
+  } else if (B0 == 0x66 && B1 == 0x90) {
+    EmitRipAddBr(Words, N, 2, LoopTop);
+  } else if (int Xn = SraXn(B0); Xn >= 0) {
+    Words[N++] = 0xD10022F7u; // sub x23, x23, #8  (RSP)
+    Words[N++] = 0xF90002E0u | static_cast<uint32_t>(Xn);
+    EmitRipAddBr(Words, N, 1, LoopTop);
+  } else {
+    void* U = UnhandledFAR0();
+    const uint64_t Host = U ? reinterpret_cast<uint64_t>(U) : 0;
+    SeedL1(Frame, GuestRIP, Host);
+    return Host;
+  }
+
+  void* Page = EmitRX(Words, N);
+  if (!Page) {
+    void* U = UnhandledFAR0();
+    return U ? reinterpret_cast<uintptr_t>(U) : 0;
+  }
+  const uint64_t Host = reinterpret_cast<uint64_t>(Page);
+  if (M->NCache < kMaxCache) {
+    M->Cache[M->NCache].Guest = GuestRIP;
+    M->Cache[M->NCache].Host = Host;
+    ++M->NCache;
+  }
+  SeedL1(Frame, GuestRIP, Host);
+  return Host;
+}
+
+} // namespace FEX::WineApple
+
+extern "C" {
+void FEXWineAppleEnsure() {
+  FEX::WineApple::Ensure();
+}
+uintptr_t FEXWineAppleCompileOneInsn(void* Frame, uint64_t GuestRIP) {
+  return FEX::WineApple::CompileOneInsn(static_cast<FEXCore::Core::CpuStateFrame*>(Frame), GuestRIP);
+}
+}
+
+#else
+
+namespace FEX::WineApple {
+void Ensure() {}
+uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame*, uint64_t) {
+  return 0;
+}
+} // namespace FEX::WineApple
+
+extern "C" {
+void FEXWineAppleEnsure() {}
+uintptr_t FEXWineAppleCompileOneInsn(void*, uint64_t) {
+  return 0;
+}
+}
+
+#endif

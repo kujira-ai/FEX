@@ -82,9 +82,8 @@ enter_jit:
 #endif
 
 #ifdef FEX_ON_WINE_APPLE
-// lp: basename → FillSRA (no C/svc on br). Hybrid miss = ret.
-// S1: hostname.exe + explorer.exe + cmd.exe. x17=CPUArea*, x9=guest PC.
-// No x13/x14 (ARM64EC-disallowed).
+// EP looks like x64 → FillSRA. ARM64EC wineboot/start (adrp/stp) ret native.
+// No C/svc (BeginSim saves ntdll Rip in x4; C would clobber). x17=CPUArea*, x9=EP.
 .globl WineAppleEnterEC
 .extern WineAppleRealFillSRA
 WineAppleEnterEC:
@@ -92,85 +91,32 @@ WineAppleEnterEC:
   cbz x16, 1f
   str x9, [x16, #0x18]           // State.rip
 1:
-  mrs x16, tpidr_el0
-  lsr x15, x16, #32
-  cbz x15, 8f
-  mov x18, x16
-  ldr x15, [x18, #0x60]          // PEB
-  cbz x15, 8f
-  lsr x8, x15, #32
-  cbz x8, 8f
-  ldr x15, [x15, #0x20]          // ProcessParameters
-  cbz x15, 8f
-  ldrh w8, [x15, #0x60]          // ImagePathName.Length
-  ldr x15, [x15, #0x68]          // Buffer
-  cbz x15, 8f
-  add x8, x15, w8, uxtw
-2:
-  cmp x8, x15
-  b.ls 8f
-  sub x8, x8, #2
-  ldrh w11, [x8]
-  cmp w11, #0x5c
-  b.eq 3f
-  cmp w11, #0x2f
-  b.ne 2b
-3:
-  add x8, x8, #2
-  mov x2, x8
-  mov w3, #0                     // 0=hostname 1=explorer 2=cmd
-30:
-  mov x8, x2
-  cmp w3, #1
-  b.eq 31f
-  b.hi 32f
-  adr x10, name_hostname
-  mov w12, #12
-  b 4f
-31:
-  adr x10, name_explorer
-  mov w12, #12
-  b 4f
-32:
-  adr x10, name_cmd
-  mov w12, #7
-4:
-  cbz w12, 5f
-  ldrh w11, [x8], #2
-  ldrh w16, [x10], #2
-  sub w15, w11, #0x41
-  cmp w15, #26
-  b.hs 41f
-  orr w11, w11, #0x20
-41:
-  cmp w11, w16
-  b.eq 42f
-  add w3, w3, #1
-  cmp w3, #3
-  b.lo 30b
-  b 8f
-42:
-  sub w12, w12, #1
-  b 4b
+  ldrb w16, [x9]
+  cmp w16, #0x90
+  b.eq 5f
+  cmp w16, #0x66
+  b.eq 5f
+  cmp w16, #0x48
+  b.eq 5f
+  cmp w16, #0xe8
+  b.eq 5f
+  cmp w16, #0xe9
+  b.eq 5f
+  sub w15, w16, #0x40
+  cmp w15, #0x18                 // 0x40–0x57 REX / PUSH r64
+  b.hs 8f
 5:
   mov w16, #1
   strb w16, [x17]                // InSimulation
   adrp x16, WineAppleRealFillSRA
   ldr x16, [x16, :lo12:WineAppleRealFillSRA]
   cbnz x16, 6f
-  ldr x16, [x17, #0x48]          // EmulatorData[3] published FillSRA
+  ldr x16, [x17, #0x48]
   cbz x16, 8f
 6:
   br x16
 8:
   ret
-  .balign 4
-name_hostname:
-  .hword 0x68,0x6f,0x73,0x74,0x6e,0x61,0x6d,0x65,0x2e,0x65,0x78,0x65
-name_explorer:
-  .hword 0x65,0x78,0x70,0x6c,0x6f,0x72,0x65,0x72,0x2e,0x65,0x78,0x65
-name_cmd:
-  .hword 0x63,0x6d,0x64,0x2e,0x65,0x78,0x65
   .balign 4
 #endif
 

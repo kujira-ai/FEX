@@ -176,8 +176,6 @@ FEX_DEFAULT_VISIBILITY void SetWineAppleContext(void* Ptr);
 FEX_DEFAULT_VISIBILITY void* GetWineAppleContext();
 // x86 `ret` page for Module.S misaligned-SP path — never write PE globals (RO 16k).
 FEX_DEFAULT_VISIBILITY void* GetOrCreateX64ReturnInstr();
-// Universal ARM64 host stub (used as L1 HostCode / CompileBlock stand-in).
-FEX_DEFAULT_VISIBILITY void* GetOrCreateWineAppleHostRetStub();
 // Last-good TEB for BeginSimulation when Darwin wipes tpidr/x18 (slab [24]).
 FEX_DEFAULT_VISIBILITY void SetWineAppleLastGoodTeb(void* Teb);
 FEX_DEFAULT_VISIBILITY void* GetWineAppleLastGoodTeb();

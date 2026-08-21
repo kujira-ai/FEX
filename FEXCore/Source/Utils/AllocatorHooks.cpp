@@ -60,7 +60,7 @@ namespace {
 constexpr size_t kWinSlabSize = 128ull << 20;
 // On FEX_ON_WINE_APPLE, slab header holds host-writable pointers (PE globals may be RO
 // on 16k pages; host mmap slab is always RW).
-// [0]=Context* [8]=X64ReturnInstr* [16]=HostRetStub* [24]=LastGoodTeb* [32]=CpuArea*
+// [0]=Context* [8]=X64ReturnInstr* [16]=unused [24]=LastGoodTeb* [32]=CpuArea*
 constexpr size_t kWineAppleSlabHeader = 48;
 void* gWinSlab {};
 size_t gWinUsed {};
@@ -192,7 +192,6 @@ void* WinBump(size_t Size, size_t Align = 16) {
 #if FEX_ON_WINE_APPLE
     gWinUsed = kWineAppleSlabHeader;
     if (gWinSlab) {
-      // Clear header: CTX, X64Ret, HostRet, LastTeb, CpuArea (+pad)
       auto* H = reinterpret_cast<void**>(gWinSlab);
       for (int I = 0; I < 6; ++I) {
         H[I] = nullptr;
@@ -232,10 +231,8 @@ void* VirtualAlloc(void* Base, size_t Size, bool Execute, bool Commit) {
   if (Base) {
     return nullptr; // fixed-base not needed on wine-apple bring-up path
   }
-  // Always RW first (EmitDispatcher / CodeBuffer writes). Darwin W^X: never
-  // leave Execute maps non-RX after emit — EmitDispatcher VirtualProtect RX
-  // (gate lb). HostRetStub uses HostMprotect RX after write. MAP_JIT not
-  // required for mprotect RX (HostRetStub proved).
+  // Always RW first (EmitDispatcher / WineAppleHost writes). Darwin W^X:
+  // VirtualProtect RX after emit. MAP_JIT not required.
   (void)Execute;
   return HostMmap(Size, 3ull /* PROT_READ|PROT_WRITE */, 0x1002ull);
 }
@@ -368,48 +365,6 @@ void* GetOrCreateX64ReturnInstr() {
   }
   *static_cast<volatile uint8_t*>(Page) = 0xc3;
   (void)HostMprotect(Page, Pg, 5ull); // RX best-effort
-  *Slot = Page;
-  return Page;
-}
-
-void* GetOrCreateWineAppleHostRetStub() {
-  EnsureWineAppleSlab();
-  if (!PlausibleSlab(gWinSlab)) {
-    return nullptr;
-  }
-  auto* Slot = reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 16);
-  if (*Slot) {
-    return *Slot;
-  }
-  // G5b: RIP+=2 then FAR-0 store. Rn≠31 (str xzr,[xzr] is [sp] — G5). TMP x10/x11.
-  constexpr size_t Pg = 16384;
-  void* Page = HostMmap(Pg, 3ull);
-  if (!Page) {
-    return nullptr;
-  }
-  auto* W = static_cast<volatile uint32_t*>(Page);
-  // offsetof(CpuStateFrame, State.rip) = 24. x28=STATE. x10/x11 = ARM64EC TMP (not SRA).
-  W[0] = 0xF9400F8Au; // ldr x10, [x28, #24]
-  W[1] = 0x9100094Au; // add x10, x10, #2
-  W[2] = 0xF9000F8Au; // str x10, [x28, #24]
-  W[3] = 0xAA1F03EBu; // mov x11, xzr
-  W[4] = 0xF900017Fu; // str xzr, [x11]
-  constexpr size_t StubBytes = 20;
-
-  {
-    uintptr_t P = reinterpret_cast<uintptr_t>(Page) & ~63ull;
-    const uintptr_t E = reinterpret_cast<uintptr_t>(Page) + StubBytes;
-    for (; P < E; P += 64) {
-      __asm__ volatile("dc cvau, %0" ::"r"(P) : "memory");
-    }
-    __asm__ volatile("dsb ish" ::: "memory");
-    P = reinterpret_cast<uintptr_t>(Page) & ~63ull;
-    for (; P < E; P += 64) {
-      __asm__ volatile("ic ivau, %0" ::"r"(P) : "memory");
-    }
-    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
-  }
-  (void)HostMprotect(Page, Pg, 5ull); // RX
   *Slot = Page;
   return Page;
 }

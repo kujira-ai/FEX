@@ -33,6 +33,7 @@ set(SRCS
   Interface/Core/OpcodeDispatcher.cpp
   Interface/Core/ArchHelpers/Arm64Emitter.cpp
   Interface/Core/Dispatcher/Dispatcher.cpp
+  Interface/Core/WineAppleHost.cpp
   Interface/Core/WineAppleDummyFexcoreGrowth.cpp
   Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp
   Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp

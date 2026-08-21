@@ -20,6 +20,7 @@ $end_info$
 #include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/JIT/JITClass.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
+#include "Interface/Core/WineAppleHost.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include <Interface/GDBJIT/GDBJIT.h>
 #include "Interface/IR/IR.h"
@@ -983,17 +984,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // No LookupCache/CPUBackend yet — seed L1 with host ret stub (same as EnterEC miss).
   (void)MaxInst;
-  void* Stub = FEXCore::Allocator::GetOrCreateWineAppleHostRetStub();
-  const uint64_t Host = Stub ? reinterpret_cast<uint64_t>(Stub) : 0;
-  if (Frame && Frame->State.L1Pointer && Host) {
-    const uint64_t Off = GuestRIP & Frame->State.L1Mask;
-    auto* E = reinterpret_cast<volatile uint64_t*>(Frame->State.L1Pointer + Off);
-    E[0] = Host;
-    E[1] = GuestRIP;
-  }
-  return Host;
+  return FEX::WineApple::CompileOneInsn(Frame, GuestRIP);
 #else
   auto Thread = Frame->Thread;
   FEXCORE_PROFILE_SCOPED("CompileBlock");

@@ -423,19 +423,30 @@ extern "C" void* FEXGetX64ReturnInstr() {
   return FEXCore::Allocator::GetOrCreateX64ReturnInstr();
 }
 
-// EnterEC miss path: seed L1 with universal host stub; return host code address.
-// No full JIT — proves enter_jit → L1 → host code without PassManager/CPUBackend.
+extern "C" uintptr_t FEXWineAppleCompileOneInsn(void* Frame, uint64_t GuestRIP);
+extern "C" void FEXWineAppleEnsure();
+
+// EnterEC miss → one-insn host backend (same as CompileBlock).
 extern "C" uint64_t FEXWineAppleCompileStub(uint64_t FrameU, uint64_t GuestRIP) {
-  auto* Frame = reinterpret_cast<FEXCore::Core::CpuStateFrame*>(FrameU);
-  void* Stub = FEXCore::Allocator::GetOrCreateWineAppleHostRetStub();
-  const uint64_t Host = Stub ? reinterpret_cast<uint64_t>(Stub) : 0;
-  if (Frame && Frame->State.L1Pointer && Host) {
-    const uint64_t Off = GuestRIP & Frame->State.L1Mask;
-    auto* E = reinterpret_cast<volatile uint64_t*>(Frame->State.L1Pointer + Off);
-    E[0] = Host;     // HostCode
-    E[1] = GuestRIP; // GuestCode
+  return FEXWineAppleCompileOneInsn(reinterpret_cast<void*>(FrameU), GuestRIP);
+}
+
+// FillSRA if EP looks like x64 (not ARM64EC code). Fail closed. Not a basename list.
+extern "C" uint64_t WineAppleEpLooksX64(uint64_t Ep) {
+  if (Ep < 0x10000ull) {
+    return 0;
   }
-  return Host;
+  const uint8_t B = *reinterpret_cast<const volatile uint8_t*>(Ep);
+  if (B == 0x90 || B == 0x66 || B == 0x48 || B == 0xe8 || B == 0xe9) {
+    return 1;
+  }
+  if (B >= 0x40 && B <= 0x4f) {
+    return 1; // REX
+  }
+  if (B >= 0x50 && B <= 0x57) {
+    return 1; // PUSH r64
+  }
+  return 0;
 }
 
 // C linkage for Module.S enter_jit — re-bind CHPE EmulatorData every entry.
@@ -1488,9 +1499,8 @@ NTSTATUS ProcessInit() {
   } else {
     FEXPiLog("FEX ProcessInit: X64ReturnInstr slab FAIL\n");
   }
-  if (FEXCore::Allocator::GetOrCreateWineAppleHostRetStub()) {
-    FEXPiLog("FEX ProcessInit: HostRetStub OK\n");
-  }
+  FEXWineAppleEnsure();
+  FEXPiLog("FEX ProcessInit: WineAppleHost OK\n");
   FEXPiLog("FEX ProcessInit: before ThreadInit\n");
   const NTSTATUS Ti = ThreadInit();
   FEXPiLog("FEX ProcessInit: after ThreadInit\n");
