@@ -97,18 +97,26 @@ void* UnhandledFAR0() {
   return M->Unhandled;
 }
 
-int SraXn(uint8_t PushOp) {
-  switch (PushOp) {
-  case 0x50: return 8;
-  case 0x51: return 0;
-  case 0x52: return 1;
-  case 0x53: return 27;
-  case 0x54: return 23;
-  case 0x55: return 29;
-  case 0x56: return 25;
-  case 0x57: return 26;
+// ARM64EC x64 SRA: RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI
+int GprXn(uint8_t Rm) {
+  switch (Rm) {
+  case 0: return 8;
+  case 1: return 0;
+  case 2: return 1;
+  case 3: return 27;
+  case 4: return 23;
+  case 5: return 29;
+  case 6: return 25;
+  case 7: return 26;
   default: return -1;
   }
+}
+
+uint32_t EncSubImm(unsigned Xn, uint32_t Imm) {
+  return 0xD1000000u | (Imm << 10) | (Xn << 5) | Xn;
+}
+uint32_t EncAddImm(unsigned Xn, uint32_t Imm) {
+  return 0x91000000u | (Imm << 10) | (Xn << 5) | Xn;
 }
 
 uint32_t EncMovz(unsigned Rd, uint16_t Imm, unsigned Hw) {
@@ -171,11 +179,13 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     }
   }
 
-  uint8_t B0 = 0, B1 = 0;
+  uint8_t B0 = 0, B1 = 0, B2 = 0, B3 = 0;
   {
     const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
     B0 = P[0];
     B1 = P[1];
+    B2 = P[2];
+    B3 = P[3];
   }
 
   uint32_t Words[16];
@@ -184,11 +194,30 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     EmitRipAddBr(Words, N, 1, LoopTop);
   } else if (B0 == 0x66 && B1 == 0x90) {
     EmitRipAddBr(Words, N, 2, LoopTop);
-  } else if (int Xn = SraXn(B0); Xn >= 0) {
-    Words[N++] = 0xD10022F7u; // sub x23, x23, #8  (RSP)
+  } else if (int Xn = GprXn(static_cast<uint8_t>(B0 - 0x50)); B0 >= 0x50 && B0 <= 0x57 && Xn >= 0) {
+    Words[N++] = EncSubImm(23, 8); // RSP -= 8
     Words[N++] = 0xF90002E0u | static_cast<uint32_t>(Xn);
     EmitRipAddBr(Words, N, 1, LoopTop);
-  } else {
+  } else if (B0 == 0x48 && B1 == 0x83 && (B2 & 0xC0) == 0xC0) {
+    // REX.W 83 /0 add r64, imm8  or  /5 sub r64, imm8  (mod=11)
+    const uint8_t Ext = (B2 >> 3) & 7;
+    const int Xn = GprXn(B2 & 7);
+    const int8_t Imm8 = static_cast<int8_t>(B3);
+    if (Xn >= 0 && (Ext == 0 || Ext == 5)) {
+      uint32_t Mag = Imm8 < 0 ? static_cast<uint32_t>(-Imm8) : static_cast<uint32_t>(Imm8);
+      const bool Sub = (Ext == 5);
+      if (Mag <= 4095) {
+        if (Sub == (Imm8 >= 0)) {
+          Words[N++] = EncSubImm(static_cast<unsigned>(Xn), Mag);
+        } else {
+          Words[N++] = EncAddImm(static_cast<unsigned>(Xn), Mag);
+        }
+        EmitRipAddBr(Words, N, 4, LoopTop);
+      }
+    }
+  }
+
+  if (N == 0) {
     void* U = UnhandledFAR0();
     const uint64_t Host = U ? reinterpret_cast<uint64_t>(U) : 0;
     SeedL1(Frame, GuestRIP, Host);
