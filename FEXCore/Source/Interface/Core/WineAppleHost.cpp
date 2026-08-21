@@ -179,13 +179,14 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     }
   }
 
-  uint8_t B0 = 0, B1 = 0, B2 = 0, B3 = 0;
+  uint8_t B0 = 0, B1 = 0, B2 = 0, B3 = 0, B4 = 0;
   {
     const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
     B0 = P[0];
     B1 = P[1];
     B2 = P[2];
     B3 = P[3];
+    B4 = P[4];
   }
 
   uint32_t Words[16];
@@ -214,6 +215,19 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
         }
         EmitRipAddBr(Words, N, 4, LoopTop);
       }
+    }
+  } else if (B0 >= 0xB8 && B0 <= 0xBF) {
+    // mov r32, imm32 — zero-extends into the 64-bit SRA GPR
+    const int Xn = GprXn(static_cast<uint8_t>(B0 - 0xB8));
+    if (Xn >= 0) {
+      const uint32_t Imm = static_cast<uint32_t>(B1) | (static_cast<uint32_t>(B2) << 8) |
+                           (static_cast<uint32_t>(B3) << 16) | (static_cast<uint32_t>(B4) << 24);
+      const unsigned Rd = static_cast<unsigned>(Xn);
+      Words[N++] = EncMovz(Rd, static_cast<uint16_t>(Imm), 0);
+      if (Imm >> 16) {
+        Words[N++] = EncMovk(Rd, static_cast<uint16_t>(Imm >> 16), 1);
+      }
+      EmitRipAddBr(Words, N, 5, LoopTop);
     }
   }
 
