@@ -210,6 +210,10 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     Words[N++] = EncSubImm(23, 8); // RSP -= 8
     Words[N++] = 0xF90002E0u | static_cast<uint32_t>(Xn);
     EmitRipAddBr(Words, N, 1, LoopTop);
+  } else if (int Xn = GprXn(static_cast<uint8_t>(B0 - 0x58)); B0 >= 0x58 && B0 <= 0x5F && Xn >= 0) {
+    Words[N++] = 0xF94002E0u | static_cast<uint32_t>(Xn); // ldr Xt, [x23]
+    Words[N++] = EncAddImm(23, 8);                       // RSP += 8
+    EmitRipAddBr(Words, N, 1, LoopTop);
   } else if (B0 == 0x48 && B1 == 0x83 && (B2 & 0xC0) == 0xC0) {
     // REX.W 83 /0 add r64, imm8  or  /5 sub r64, imm8  (mod=11)
     const uint8_t Ext = (B2 >> 3) & 7;
