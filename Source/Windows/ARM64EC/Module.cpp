@@ -1332,6 +1332,28 @@ extern "C" void ApplyJitStateToCpuForEcEntry() {
     __asm__ volatile( "mov %0, sp" : "=r"( sp ) );
   }
 
+#if FEX_ON_WINE_APPLE
+  // Do not write x19–x29: those are C callee-saved / FP. Setting x29 here
+  // made the epilogue pop [guest RBP] and br to CHPE Area+0x50 (hn4).
+  (void)sp;
+  (void)fp;
+  (void)x5;
+  (void)x19;
+  (void)x20;
+  (void)x21;
+  (void)x22;
+  (void)x25;
+  (void)x26;
+  (void)x27;
+  __asm__ volatile("mov x0, %0\n\t"
+                   "mov x1, %1\n\t"
+                   "mov x2, %2\n\t"
+                   "mov x3, %3\n\t"
+                   "mov x8, %4\n"
+                   :
+                   : "r"(x0), "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                   : "x0", "x1", "x2", "x3", "x8");
+#else
   __asm__ volatile("mov x0, %0\n\t"
                    "mov x1, %1\n\t"
                    "mov x2, %2\n\t"
@@ -1355,6 +1377,7 @@ extern "C" void ApplyJitStateToCpuForEcEntry() {
                    "mov x29, %2\n"
                    : : "r"(x26), "r"(x27), "r"(fp)
                    : "x26", "x27", "x29");
+#endif
 }
 
 extern "C" void SyncThreadContext(CONTEXT* Context) {

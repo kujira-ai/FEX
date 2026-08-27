@@ -82,6 +82,21 @@ enter_jit:
 #endif
 
 #ifdef FEX_ON_WINE_APPLE
+// Native ARM64 ret after ExitFunctionEC: Frame->rip is the x64 caller. FillSRA.
+.globl WineAppleAfterNative
+WineAppleAfterNative:
+  mrs x18, tpidr_el0
+  ldr x17, [x18, #0x1788]
+  cbz x17, 9f
+  mov w16, #1
+  strb w16, [x17]
+  adrp x16, WineAppleRealFillSRA
+  ldr x16, [x16, :lo12:WineAppleRealFillSRA]
+  cbz x16, 9f
+  br x16
+9:
+  ret
+
 // EP looks like x64 → FillSRA. ARM64EC wineboot/start (adrp/stp) ret native.
 // No C/svc (BeginSim saves ntdll Rip in x4; C would clobber). x17=CPUArea*, x9=EP.
 .globl WineAppleEnterEC
@@ -194,6 +209,14 @@ BeginSimulation:
   // Expects the target code address in x9
 .global ExitFunctionEC
 ExitFunctionEC:
+#ifdef FEX_ON_WINE_APPLE
+  // x9 = ARM64 target. Save it and the x64 return before any C (StoreJit clobbers x9).
+  ldr x16, [sp], #8
+  mov x15, sp
+  bic x15, x15, #0xf
+  mov sp, x15
+  stp x9, x16, [sp, #-16]!
+#endif
   mrs x18, tpidr_el0
   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
   mrs x17, fpcr
@@ -211,6 +234,19 @@ ExitFunctionEC:
 .global ExitFunctionSuspendResumePoint
 ExitFunctionSuspendResumePoint:
   mrs x18, tpidr_el0
+#ifdef FEX_ON_WINE_APPLE
+  // Frame->rip = x64 return so AfterNative/EnterEC resume the caller, not ARM64.
+  ldr x17, [x18, #0x1788]
+  ldr x15, [x17, #0x30]
+  ldp x9, x16, [sp]
+  str x16, [x15, #0x18]
+  bl "#ApplyJitStateToCpuForEcEntry"
+  mrs x18, tpidr_el0
+  ldp x9, x16, [sp], #16
+  adrp x30, WineAppleAfterNative
+  add x30, x30, :lo12:WineAppleAfterNative
+  br x9
+#endif
   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).
   // It is assumed that a 'blr x16' instruction is only ever used to call into x86 code from an exit thunk, and that all
   // exported ARM64EC functions have a 4-byte offset to their entry thunk immediately before their first instruction.
