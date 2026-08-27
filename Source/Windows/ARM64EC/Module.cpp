@@ -1158,26 +1158,40 @@ public:
   }
 
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
+    if (!ImageTracker) {
+      return std::nullopt;
+    }
     return ImageTracker->LookupExecutableFileSection(Address);
   }
 
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    InvalidationTracker->ReprotectRWXIntervals(Start, Length);
+    if (InvalidationTracker) {
+      InvalidationTracker->ReprotectRWXIntervals(Start, Length);
+    }
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    if (InvalidationTracker) {
+      InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    }
   }
 
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
-    OvercommitTracker->MarkRange(Start, Length);
+    if (OvercommitTracker) {
+      OvercommitTracker->MarkRange(Start, Length);
+    }
   }
 
   void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) override {
-    OvercommitTracker->UnmarkRange(Start, Length);
+    if (OvercommitTracker) {
+      OvercommitTracker->UnmarkRange(Start, Length);
+    }
   }
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
+    if (!InvalidationTracker) {
+      return {0, UINT64_MAX, true};
+    }
     return InvalidationTracker->QueryExecutableRange(Address);
   }
 

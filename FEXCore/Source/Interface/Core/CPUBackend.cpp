@@ -285,7 +285,11 @@ namespace CPU {
     }
 
     // Copy named vector constants.
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::HostCopy(Ptrs.NamedVectorConstants, NamedVectorConstants, sizeof(NamedVectorConstants));
+#else
     memcpy(Ptrs.NamedVectorConstants, NamedVectorConstants, sizeof(NamedVectorConstants));
+#endif
 
     // Initialize Indexed named vector constants.
     Ptrs.IndexedNamedVectorConstantPointers[FEXCore::IR::IndexNamedVectorConstant::INDEXED_NAMED_VECTOR_PSHUFLW] =

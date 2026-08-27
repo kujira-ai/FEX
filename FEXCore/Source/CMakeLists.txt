@@ -298,6 +298,10 @@ if (CMAKE_HOST_APPLE)
   target_compile_definitions(${PROJECT_NAME}_object PRIVATE FEX_WINE_APPLE_DUMMY_NOPS=${FEX_WINE_APPLE_DUMMY_NOPS})
   target_compile_options(${PROJECT_NAME}_object PRIVATE
     -fno-function-sections
+    -fno-builtin-memset
+    -fno-builtin-memcpy
+    -fno-builtin-memmove
+    -fno-builtin-memcmp
     "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/Interface/Core/WineAppleFexcoreSec.h")
 endif()
 AddLibrary(${PROJECT_NAME} STATIC)

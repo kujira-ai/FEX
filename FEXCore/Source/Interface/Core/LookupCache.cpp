@@ -39,14 +39,26 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // We need one pointer per page of virtual memory
   // At 64GB of virtual memory this will allocate 128MB of virtual memory space
   PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  if (!PagePointer) {
+    PageMemory = 0;
+    L1Pointer = 0;
+    L1PointerMask = 0;
+    VirtualMemSize = ctx->Config.VirtualMemSize;
+    return;
+  }
+#else
   LOGMAN_THROW_A_FMT(PagePointer != -1ULL, "Failed to allocate PagePointer");
+#endif
 
   // Disable THP on the Lookup cache.
   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);
 
   FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer),
                                   ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE);
-  CTX->SyscallHandler->MarkOvercommitRange(PagePointer, TotalCacheSize);
+  if (CTX->SyscallHandler) {
+    CTX->SyscallHandler->MarkOvercommitRange(PagePointer, TotalCacheSize);
+  }
 
   // Allocate our memory backing our pages
   // We need 32KB per guest page (One pointer per byte)
@@ -71,8 +83,12 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
 }
 
 LookupCache::~LookupCache() {
-  FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(PagePointer), TotalCacheSize);
-  ctx->SyscallHandler->UnmarkOvercommitRange(PagePointer, TotalCacheSize);
+  if (PagePointer) {
+    FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(PagePointer), TotalCacheSize);
+    if (ctx->SyscallHandler) {
+      ctx->SyscallHandler->UnmarkOvercommitRange(PagePointer, TotalCacheSize);
+    }
+  }
 
   // No need to free BlockLinks map.
   // These will get freed when their memory allocators are deallocated.

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT
+#ifndef FEX_ON_WINE_APPLE
+#define FEX_ON_WINE_APPLE 0
+#endif
 #define _SECIMP
 #define _CRTIMP
 
@@ -17,6 +20,56 @@
 #undef vsprintf
 
 extern "C" int __cdecl vsprintf(char* __restrict__ _Dest, const char* __restrict__ _Format, va_list _Args) __MINGW_ATTRIB_DEPRECATED_SEC_WARN;
+
+#if FEX_ON_WINE_APPLE
+// ARM64EC clang emits `bl #memset` (x64-named) for large ctors. Provide ARM64
+// bodies so InitializeCompiler does not exit-thunk into ntdll (c000001d).
+extern "C" {
+void* memset(void* Dst, int Val, size_t N) {
+  auto* P = static_cast<volatile unsigned char*>(Dst);
+  const auto B = static_cast<unsigned char>(Val);
+  for (size_t I = 0; I < N; ++I) {
+    P[I] = B;
+  }
+  return Dst;
+}
+void* memcpy(void* Dst, const void* Src, size_t N) {
+  auto* D = static_cast<volatile unsigned char*>(Dst);
+  const auto* S = static_cast<const unsigned char*>(Src);
+  for (size_t I = 0; I < N; ++I) {
+    D[I] = S[I];
+  }
+  return Dst;
+}
+void* memmove(void* Dst, const void* Src, size_t N) {
+  auto* D = static_cast<volatile unsigned char*>(Dst);
+  const auto* S = static_cast<const unsigned char*>(Src);
+  if (D == S || N == 0) {
+    return Dst;
+  }
+  if (D < S) {
+    for (size_t I = 0; I < N; ++I) {
+      D[I] = S[I];
+    }
+  } else {
+    for (size_t I = N; I > 0; --I) {
+      D[I - 1] = S[I - 1];
+    }
+  }
+  return Dst;
+}
+int memcmp(const void* A, const void* B, size_t N) {
+  const auto* P = static_cast<const unsigned char*>(A);
+  const auto* Q = static_cast<const unsigned char*>(B);
+  for (size_t I = 0; I < N; ++I) {
+    if (P[I] != Q[I]) {
+      return static_cast<int>(P[I]) - static_cast<int>(Q[I]);
+    }
+  }
+  return 0;
+}
+}
+#endif
 
 static unsigned short CTypeData[256];
 static char Locale[2] = "C";

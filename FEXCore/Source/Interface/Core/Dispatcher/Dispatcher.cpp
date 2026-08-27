@@ -327,10 +327,10 @@ void Dispatcher::EmitDispatcher() {
   ARMEmitter::ForwardLabel NoBlock;
 
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // wine-apple: LookupCache/L2 not built (InitializeCompiler is L1-only). Always
-  // miss → CompileBlock → WineAppleHost one-insn (RX).
-  (void)b(&NoBlock);
-#else
+  // L2Pointer is 0 until LookupCache constructs.
+  ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.L2Pointer));
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoBlock);
+#endif
   if (DisableL2Cache()) {
     (void)b(&NoBlock);
   } else {
@@ -392,7 +392,6 @@ void Dispatcher::EmitDispatcher() {
       }
     }
   }
-#endif
 
   {
     ThreadStopHandlerAddressSpillSRA = GetCursorAddress<uint64_t>();

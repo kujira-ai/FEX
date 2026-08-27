@@ -60,7 +60,7 @@ namespace {
 constexpr size_t kWinSlabSize = 128ull << 20;
 // On FEX_ON_WINE_APPLE, slab header holds host-writable pointers (PE globals may be RO
 // on 16k pages; host mmap slab is always RW).
-// [0]=Context* [8]=X64ReturnInstr* [16]=unused [24]=LastGoodTeb* [32]=CpuArea*
+// [0]=Context* [8]=X64ReturnInstr* [16]=HostMeta* [24]=LastGoodTeb* [32]=CpuArea*
 constexpr size_t kWineAppleSlabHeader = 48;
 void* gWinSlab {};
 size_t gWinUsed {};
@@ -398,6 +398,21 @@ void* GetWineAppleCpuArea() {
   }
   return *reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 32);
 }
+
+void SetWineAppleHostMeta(void* Ptr) {
+  EnsureWineAppleSlab();
+  if (!PlausibleSlab(gWinSlab)) {
+    return;
+  }
+  *reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 16) = Ptr;
+}
+
+void* GetWineAppleHostMeta() {
+  if (!PlausibleSlab(gWinSlab)) {
+    return nullptr;
+  }
+  return *reinterpret_cast<void**>(reinterpret_cast<char*>(gWinSlab) + 16);
+}
 #endif
 
 void InitializeThread() {}
@@ -578,3 +593,56 @@ void InitializeAllocator(size_t PageSize) {}
 
 #endif
 } // namespace FEXCore::Allocator
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+// ARM64EC clang emits #memset/#memcpy (x64 IAT). These are ARM64 loops so
+// FEXCore ctors (OpDispatchBuilder) do not exit-thunk before the JIT exists.
+extern "C" {
+void* FEX_WineApple_memset(void* Dst, int Val, size_t N) {
+  auto* P = static_cast<unsigned char*>(Dst);
+  const auto B = static_cast<unsigned char>(Val);
+  for (size_t I = 0; I < N; ++I) {
+    P[I] = B;
+  }
+  return Dst;
+}
+
+void* FEX_WineApple_memcpy(void* Dst, const void* Src, size_t N) {
+  auto* D = static_cast<unsigned char*>(Dst);
+  const auto* S = static_cast<const unsigned char*>(Src);
+  for (size_t I = 0; I < N; ++I) {
+    D[I] = S[I];
+  }
+  return Dst;
+}
+
+void* FEX_WineApple_memmove(void* Dst, const void* Src, size_t N) {
+  auto* D = static_cast<unsigned char*>(Dst);
+  const auto* S = static_cast<const unsigned char*>(Src);
+  if (D == S || N == 0) {
+    return Dst;
+  }
+  if (D < S) {
+    for (size_t I = 0; I < N; ++I) {
+      D[I] = S[I];
+    }
+  } else {
+    for (size_t I = N; I > 0; --I) {
+      D[I - 1] = S[I - 1];
+    }
+  }
+  return Dst;
+}
+
+int FEX_WineApple_memcmp(const void* A, const void* B, size_t N) {
+  const auto* P = static_cast<const unsigned char*>(A);
+  const auto* Q = static_cast<const unsigned char*>(B);
+  for (size_t I = 0; I < N; ++I) {
+    if (P[I] != Q[I]) {
+      return static_cast<int>(P[I]) - static_cast<int>(Q[I]);
+    }
+  }
+  return 0;
+}
+}
+#endif

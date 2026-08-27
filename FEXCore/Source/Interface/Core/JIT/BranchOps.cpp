@@ -53,6 +53,23 @@ DEF_OP(ExitFunction) {
     udf(0x420F);
   }
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Always LoopTop so Dispatcher NULL-map ARM64 peek runs (EcBitMap is NULL).
+  {
+    uint64_t ImmRIP {};
+    if (IsInlineConstant(Op->NewRIP, &ImmRIP) || IsInlineEntrypointOffset(Op->NewRIP, &ImmRIP)) {
+      InsertGuestRIPMove(TMP1, ImmRIP);
+      str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+    } else {
+      auto RipReg = GetReg(Op->NewRIP);
+      str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+    }
+    ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+    br(TMP2);
+  }
+  return;
+#endif
+
   uint64_t NewRIP;
 
   if (IsInlineConstant(Op->NewRIP, &NewRIP) || IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {

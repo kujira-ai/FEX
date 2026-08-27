@@ -25,6 +25,7 @@ $end_info$
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -1064,7 +1065,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   JITBlockTail.Size = CodeData.Size;
   {
     auto PrevCur = GetCursorOffset();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::HostCopy(JITBlockTailLocation, &JITBlockTail, sizeof(JITBlockTail));
+#else
     memcpy(JITBlockTailLocation, &JITBlockTail, sizeof(JITBlockTail));
+#endif
     SetCursorOffset(JITBlockTailLocation - CodeData.BlockBegin + offsetof(JITCodeTail, RIP));
     PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(JITBlockTail.RIP));
     SetCursorOffset(PrevCur);
@@ -1112,7 +1117,13 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     }
 
     // Copy over CodeBuffer contents
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    (void)FEXCore::Allocator::VirtualProtect(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->UsableSize(),
+                                             FEXCore::Allocator::ProtectOptions::Read | FEXCore::Allocator::ProtectOptions::Write);
+    FEXCore::Allocator::HostCopy(GetCursorAddress<uint8_t*>(), TempCodeBuffer, TempSize);
+#else
     memcpy(GetCursorAddress<uint8_t*>(), TempCodeBuffer, TempSize);
+#endif
     SetCursorOffset(CodeBuffers.LatestOffset + TempSize);
 
     CodeBuffers.LatestOffset = GetCursorOffset();
@@ -1121,6 +1132,12 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   TempAllocator.DelayedDisownBuffer();
 
   ClearICache(CodeBegin, CodeOnlySize);
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)FEXCore::Allocator::VirtualProtect(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->UsableSize(),
+                                           FEXCore::Allocator::ProtectOptions::Read | FEXCore::Allocator::ProtectOptions::Exec);
+  ClearICache(CodeBegin, CodeOnlySize);
+#endif
 
 #ifdef VIXL_DISASSEMBLER
   if (Disassemble() & FEXCore::Config::Disassemble::STATS) {

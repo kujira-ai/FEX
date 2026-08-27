@@ -27,17 +27,21 @@ struct Meta {
 
 bool PlausibleMeta(void* P) {
   const auto U = reinterpret_cast<uintptr_t>(P);
-  if (U < 0x10000ull || (U & 0xFFFull) != 0) {
+  if (U < 0x10000ull || (U & 0x3FFFull) != 0) {
     return false;
   }
   if ((U & 0xFFFFFFFFull) == 0 || U >= 0x0001'0000'0000'0000ull) {
+    return false;
+  }
+  // Wine PE maps ~0x6ffff… — never treat as host mmap (16k RO pages).
+  if ((U >> 28) == 0x6ffffull) {
     return false;
   }
   return true;
 }
 
 Meta* GetMeta() {
-  static Meta* P {};
+  auto* P = static_cast<Meta*>(FEXCore::Allocator::GetWineAppleHostMeta());
   if (!PlausibleMeta(P)) {
     void* Page = FEXCore::Allocator::VirtualAlloc(kPage, false, true);
     if (!Page) {
@@ -48,6 +52,7 @@ Meta* GetMeta() {
       M[I] = 0;
     }
     P = static_cast<Meta*>(Page);
+    FEXCore::Allocator::SetWineAppleHostMeta(P);
   }
   return P;
 }

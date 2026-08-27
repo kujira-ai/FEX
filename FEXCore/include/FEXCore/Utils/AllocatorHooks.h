@@ -53,6 +53,15 @@ FEX_DEFAULT_VISIBILITY void* VirtualAlloc(size_t Size, bool Execute = false, boo
 FEX_DEFAULT_VISIBILITY void VirtualFree(void* Ptr, size_t Size);
 FEX_DEFAULT_VISIBILITY void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true);
 FEX_DEFAULT_VISIBILITY bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options);
+
+// libc memcpy/memset are ARM64EC exit-thunks before the JIT exists.
+inline void HostCopy(void* Dst, const void* Src, size_t N) {
+  auto* D = static_cast<unsigned char*>(Dst);
+  const auto* S = static_cast<const unsigned char*>(Src);
+  for (size_t I = 0; I < N; ++I) {
+    D[I] = S[I];
+  }
+}
 #else
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
@@ -182,6 +191,9 @@ FEX_DEFAULT_VISIBILITY void* GetWineAppleLastGoodTeb();
 // CHPE CPU area pointer (slab [32]) — BeginSimulation without TEB.
 FEX_DEFAULT_VISIBILITY void SetWineAppleCpuArea(void* Area);
 FEX_DEFAULT_VISIBILITY void* GetWineAppleCpuArea();
+// WineAppleHost one-insn cache Meta* (slab [16]) — PE statics are RO on 16k pages.
+FEX_DEFAULT_VISIBILITY void SetWineAppleHostMeta(void* Ptr);
+FEX_DEFAULT_VISIBILITY void* GetWineAppleHostMeta();
 #endif
 
 FEX_DEFAULT_VISIBILITY extern void InitializeThread();

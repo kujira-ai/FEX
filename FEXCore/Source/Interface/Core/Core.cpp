@@ -468,28 +468,68 @@ void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
 
 void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread) {
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // Full compiler (make_unique/LookupCache maps/JIT) still exit-thunks. Host-alloc L1 only so
-  // STATE.L1Pointer is non-null (jul10ah) — empty L1 means FindBlock always misses, no fault.
-  FEXCtorLog("InitializeCompiler: L1 host alloc\n");
-  constexpr size_t L1Entries = 8 * 1024; // match LookupCache MIN_L1_ENTRIES
-  constexpr size_t EntrySize = 16;       // LookupCacheEntry {HostCode, GuestCode}
-  constexpr size_t L1Bytes = L1Entries * EntrySize;
-  void* L1 = FEXCore::Allocator::VirtualAlloc(L1Bytes, false, true);
-  if (L1) {
-    volatile unsigned char* B = static_cast<volatile unsigned char*>(L1);
-    for (size_t I = 0; I < L1Bytes; ++I) {
-      B[I] = 0;
+  auto WineAppleL1Only = [&]() {
+    FEXCtorLog("InitializeCompiler: L1 host alloc\n");
+    constexpr size_t L1Entries = 8 * 1024;
+    constexpr size_t EntrySize = 16;
+    constexpr size_t L1Bytes = L1Entries * EntrySize;
+    void* L1 = FEXCore::Allocator::VirtualAlloc(L1Bytes, false, true);
+    if (L1) {
+      volatile unsigned char* B = static_cast<volatile unsigned char*>(L1);
+      for (size_t I = 0; I < L1Bytes; ++I) {
+        B[I] = 0;
+      }
+      Thread->CurrentFrame->State.L1Pointer = reinterpret_cast<uint64_t>(L1);
+      Thread->CurrentFrame->State.L1Mask = static_cast<uint64_t>(L1Entries - 1) * EntrySize;
+      FEXCtorLog("InitializeCompiler: L1 OK\n");
+    } else {
+      FEXCtorLog("InitializeCompiler: L1 alloc FAILED\n");
     }
-    Thread->CurrentFrame->State.L1Pointer = reinterpret_cast<uint64_t>(L1);
-    // Scaled mask as GetScaledL1PointerMask: (entries-1) << log2(EntrySize)
-    Thread->CurrentFrame->State.L1Mask = static_cast<uint64_t>(L1Entries - 1) * EntrySize;
-    FEXCtorLog("InitializeCompiler: L1 OK\n");
-  } else {
-    FEXCtorLog("InitializeCompiler: L1 alloc FAILED\n");
+    if (Dispatcher) {
+      Dispatcher->InitThreadPointers(Thread);
+    }
+  };
+
+  FEXCtorLog("InitializeCompiler: Hangover begin\n");
+  Thread->OpDispatcher = fextl::make_unique<FEXCore::IR::OpDispatchBuilder>(this);
+  FEXCtorLog("InitializeCompiler: OpDispatcher\n");
+  // Single-insn blocks: LoopTop NULL-map peek must see every RIP (no ARM64 in a block).
+  Thread->OpDispatcher->SetMultiblock(false);
+
+  Thread->LookupCache = fextl::make_unique<FEXCore::LookupCache>(this);
+  FEXCtorLog("InitializeCompiler: LookupCache\n");
+  if (!Thread->LookupCache || !Thread->LookupCache->GetL1Pointer()) {
+    FEXCtorLog("InitializeCompiler: LookupCache FAIL, L1 fallback\n");
+    WineAppleL1Only();
+    return;
   }
+
+  Thread->FrontendDecoder = fextl::make_unique<FEXCore::Frontend::Decoder>(Thread);
+  FEXCtorLog("InitializeCompiler: Decoder\n");
+  Thread->PassManager = fextl::make_unique<FEXCore::IR::PassManager>();
+  FEXCtorLog("InitializeCompiler: PassManager\n");
+
+  Thread->CurrentFrame->State.L1Pointer = Thread->LookupCache->GetL1Pointer();
+  Thread->CurrentFrame->State.L1Mask = Thread->LookupCache->GetScaledL1PointerMask();
+  Thread->CurrentFrame->Pointers.L2Pointer = Thread->LookupCache->GetPagePointer();
+
   if (Dispatcher) {
     Dispatcher->InitThreadPointers(Thread);
   }
+
+  Thread->PassManager->AddDefaultPasses(this);
+  Thread->PassManager->AddDefaultValidationPasses();
+  Thread->PassManager->RegisterSyscallHandler(SyscallHandler);
+  Thread->PassManager->InsertRegisterAllocationPass(this);
+  FEXCtorLog("InitializeCompiler: before Arm64JITCore\n");
+  Thread->CPUBackend = FEXCore::CPU::CreateArm64JITCore(this, Thread);
+  if (!Thread->CPUBackend) {
+    FEXCtorLog("InitializeCompiler: Arm64JITCore FAIL, L1 fallback\n");
+    WineAppleL1Only();
+    return;
+  }
+  Thread->PassManager->Finalize();
+  FEXCtorLog("InitializeCompiler: Arm64JITCore\n");
   return;
 #else
   Thread->OpDispatcher = fextl::make_unique<FEXCore::IR::OpDispatchBuilder>(this);
@@ -984,9 +1024,10 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  (void)MaxInst;
-  return FEX::WineApple::CompileOneInsn(Frame, GuestRIP);
-#else
+  if (!Frame || !Frame->Thread || !Frame->Thread->CPUBackend || !Frame->Thread->LookupCache) {
+    return FEX::WineApple::CompileOneInsn(Frame, GuestRIP);
+  }
+#endif
   auto Thread = Frame->Thread;
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
@@ -1087,7 +1128,6 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   return (uintptr_t)CodePtr;
-#endif
 }
 
 uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
