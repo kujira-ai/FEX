@@ -122,6 +122,9 @@ uint32_t EncAddImm(unsigned Xn, uint32_t Imm) {
 uint32_t EncMovReg(unsigned Rd, unsigned Rm) {
   return 0xAA0003E0u | (Rm << 16) | Rd; // mov Xd, Xm
 }
+uint32_t EncStrUoff(unsigned Rt, unsigned Rn, uint32_t ByteOff) {
+  return 0xF9000000u | ((ByteOff / 8) << 10) | (Rn << 5) | Rt;
+}
 uint32_t EncMovz(unsigned Rd, uint16_t Imm, unsigned Hw) {
   return 0xD2800000u | (Hw << 21) | (static_cast<uint32_t>(Imm) << 5) | Rd;
 }
@@ -231,6 +234,21 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     if (Dst >= 0 && Src >= 0) {
       Words[N++] = EncMovReg(static_cast<unsigned>(Dst), static_cast<unsigned>(Src));
       EmitRipAddBr(Words, N, 3, LoopTop);
+    }
+  } else if (B0 == 0x48 && B1 == 0x89 && (B2 & 7) != 4) {
+    // REX.W 89 /r mov r/m64, r64 — mod=01 disp8, no SIB
+    const uint8_t Mod = B2 >> 6;
+    const int Src = GprXn((B2 >> 3) & 7);
+    const int Base = GprXn(B2 & 7);
+    if (Mod == 1 && Src >= 0 && Base >= 0) {
+      const int8_t Disp = static_cast<int8_t>(B3);
+      if (Disp >= 0 && (Disp & 7) == 0) {
+        const uint32_t Off = static_cast<uint32_t>(Disp);
+        if ((Off / 8) <= 4095) {
+          Words[N++] = EncStrUoff(static_cast<unsigned>(Src), static_cast<unsigned>(Base), Off);
+          EmitRipAddBr(Words, N, 4, LoopTop);
+        }
+      }
     }
   } else if (B0 >= 0xB8 && B0 <= 0xBF) {
     // mov r32, imm32 — zero-extends into the 64-bit SRA GPR
