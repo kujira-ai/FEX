@@ -221,8 +221,21 @@ ExitFunctionSuspendResumePoint:
   cmp w23, w16
   beq ret_sp_aligned
 
+#ifdef FEX_ON_WINE_APPLE
+  // llvm-mingw ARM64EC often has a prior insn at [fn-4], not a thunk offset.
+  cmp w23, #0x4000
+  b.ge 1f
+  cmn w23, #0x4000
+  b.lt 1f
+#endif
   and x23, x23, #-0x4
   add x17, x17, x23 // Resolve entry thunk address.
+#ifdef FEX_ON_WINE_APPLE
+  b 2f
+1:
+  mov x17, x9
+2:
+#endif
 
   mov x23, sp
   tbz x23, #3, call_sp_misaligned
@@ -230,9 +243,10 @@ ExitFunctionSuspendResumePoint:
   mov sp, x23
 
 call_sp_aligned:
-  mov x28, x9
+  stp x9, x17, [sp, #-16]!
   bl "#ApplyJitStateToCpuForEcEntry"
-  mov x9, x28
+  mrs x18, tpidr_el0
+  ldp x9, x17, [sp], #16
   br x17
 
 call_sp_misaligned:
@@ -245,9 +259,10 @@ call_sp_misaligned:
   mov lr, x0
   ldp x9, x17, [sp], #16
   cbz lr, ret_sp_aligned
-  mov x28, x9
+  stp x9, x17, [sp, #-16]!
   bl "#ApplyJitStateToCpuForEcEntry"
-  mov x9, x28
+  mrs x18, tpidr_el0
+  ldp x9, x17, [sp], #16
   br x17
 
 ret_sp_aligned:

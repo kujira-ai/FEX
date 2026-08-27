@@ -1228,7 +1228,9 @@ static void FinishWineAppleProcessInit() {
 // Persist the current JIT GPR state into ContextAmd64 before leaving simulation.
 extern "C" void StoreJitStateToContextAmd64() {
   FEXSyncTebX18();
+#if !FEX_ON_WINE_APPLE
   ProcessPendingCrossProcessEmulatorWork();
+#endif
   const auto CPUArea = GetCPUArea();
   auto* Thread = CPUArea.ThreadState();
   FEXCore::Core::CpuStateFrame* Frame = Thread ? Thread->CurrentFrame : CPUArea.StateFrame();
@@ -1262,7 +1264,9 @@ extern "C" void StoreJitStateToContextAmd64() {
 // x9 must already hold the target function address; x17 holds the entry thunk.
 extern "C" void ApplyJitStateToCpuForEcEntry() {
   FEXSyncTebX18();
+#if !FEX_ON_WINE_APPLE
   ProcessPendingCrossProcessEmulatorWork();
+#endif
   const auto CPUArea = GetCPUArea();
   auto* Thread = CPUArea.ThreadState();
   FEXCore::Core::CpuStateFrame* Frame = Thread ? Thread->CurrentFrame : CPUArea.StateFrame();
@@ -1326,13 +1330,6 @@ extern "C" void ApplyJitStateToCpuForEcEntry() {
 
   if (!sp) {
     __asm__ volatile( "mov %0, sp" : "=r"( sp ) );
-  }
-
-  {
-    char buf[128];
-    snprintf( buf, sizeof(buf), "ApplyJit rcx=%llx rdx=%llx r8=%llx\n",
-              (unsigned long long)x0, (unsigned long long)x1, (unsigned long long)x2 );
-    __wine_dbg_output( buf );
   }
 
   __asm__ volatile("mov x0, %0\n\t"
