@@ -255,6 +255,10 @@ void Dispatcher::EmitDispatcher() {
   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
   ARMEmitter::ForwardLabel l_NotECCode;
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  ARMEmitter::ForwardLabel l_NullMap;
+  ARMEmitter::ForwardLabel l_NotFF25;
+#endif
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
   // G3u: x18=0 after FillSRA (lt fake-TEB clobbered). PEB from tpidr, not x18.
   // Do not write x18. Do not drop lt. Not lu (that overwrote LoopTop only after 0x31).
   mrs(ARMEmitter::Reg::r11, ARMEmitter::SystemRegister::TPIDR_EL0);
@@ -264,8 +268,9 @@ void Dispatcher::EmitDispatcher() {
 #endif
   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // pure-x64: EcCodeBitMap often NULL — treat as all-x64 (enter CompileBlock), not native.
-  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NotECCode);
+  // NULL map: do not treat as all-x64. ntdll arm64x_check_call follows ff 25 as
+  // IAT then ExitFunctionEC for ARM64EC bodies (G16).
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NullMap);
 #endif
 
   lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg, 15);
@@ -281,6 +286,37 @@ void Dispatcher::EmitDispatcher() {
   mov(EC_CALL_CHECKER_PC_REG, RipReg);
   ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
   br(TMP2);
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)Bind(&l_NullMap);
+  ldrb(TMP1.W(), RipReg, 0);
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0xff);
+  (void)b(ARMEmitter::Condition::CC_NE, &l_NotFF25);
+  ldrb(TMP2.W(), RipReg, 1);
+  cmp(ARMEmitter::Size::i32Bit, TMP2, 0x25);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  (void)Bind(&l_NotFF25);
+  // x64: REX/PUSH/POP 40-5f, 66, 90, B8-BF, E8/E9. ARM64 body (e.g. FF 83) falls through.
+  sub(ARMEmitter::Size::i32Bit, TMP2, TMP1, 0x40);
+  cmp(ARMEmitter::Size::i32Bit, TMP2, 0x20);
+  (void)b(ARMEmitter::Condition::CC_LO, &l_NotECCode);
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x66);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x90);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  sub(ARMEmitter::Size::i32Bit, TMP2, TMP1, 0xb8);
+  cmp(ARMEmitter::Size::i32Bit, TMP2, 0x8);
+  (void)b(ARMEmitter::Condition::CC_LO, &l_NotECCode);
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0xe8);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0xe9);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+  add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
+  mov(EC_CALL_CHECKER_PC_REG, RipReg);
+  ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
+  br(TMP2);
+#endif
 
   (void)Bind(&l_NotECCode);
 #endif
