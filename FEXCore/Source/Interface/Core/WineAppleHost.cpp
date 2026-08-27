@@ -119,6 +119,9 @@ uint32_t EncAddImm(unsigned Xn, uint32_t Imm) {
   return 0x91000000u | (Imm << 10) | (Xn << 5) | Xn;
 }
 
+uint32_t EncMovReg(unsigned Rd, unsigned Rm) {
+  return 0xAA0003E0u | (Rm << 16) | Rd; // mov Xd, Xm
+}
 uint32_t EncMovz(unsigned Rd, uint16_t Imm, unsigned Hw) {
   return 0xD2800000u | (Hw << 21) | (static_cast<uint32_t>(Imm) << 5) | Rd;
 }
@@ -136,20 +139,6 @@ void EmitMovAbs(uint32_t* Out, size_t& N, unsigned Rd, uint64_t Abs) {
 void EmitBrAbs(uint32_t* Out, size_t& N, unsigned Rd, uint64_t Abs) {
   EmitMovAbs(Out, N, Rd, Abs);
   Out[N++] = 0xD61F0000u | (Rd << 5);
-}
-
-bool GuestLooksX64(uint64_t Ep) {
-  if (Ep < 0x10000ull) {
-    return false;
-  }
-  const uint8_t B = *reinterpret_cast<const volatile uint8_t*>(Ep);
-  if (B == 0x90 || B == 0x66 || B == 0x48 || B == 0xe8 || B == 0xe9) {
-    return true;
-  }
-  if (B >= 0x40 && B <= 0x57) {
-    return true;
-  }
-  return false;
 }
 
 void EmitRipAddBr(uint32_t* Out, size_t& N, uint32_t Delta, uint64_t LoopTop) {
@@ -235,6 +224,14 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
         EmitRipAddBr(Words, N, 4, LoopTop);
       }
     }
+  } else if (B0 == 0x48 && B1 == 0x8B && (B2 & 0xC0) == 0xC0) {
+    // REX.W 8B /r mov r64, r64 (mod=11)
+    const int Dst = GprXn((B2 >> 3) & 7);
+    const int Src = GprXn(B2 & 7);
+    if (Dst >= 0 && Src >= 0) {
+      Words[N++] = EncMovReg(static_cast<unsigned>(Dst), static_cast<unsigned>(Src));
+      EmitRipAddBr(Words, N, 3, LoopTop);
+    }
   } else if (B0 >= 0xB8 && B0 <= 0xBF) {
     // mov r32, imm32 — zero-extends into the 64-bit SRA GPR
     const int Xn = GprXn(static_cast<uint8_t>(B0 - 0xB8));
@@ -265,29 +262,16 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
       Words[N++] = 0xAA1F03EBu;
       Words[N++] = 0xF900017Fu;
     }
-  } else if (B0 == 0xFF && B1 == 0x25) {
-    // jmp qword [rip+disp32]: load IAT, RIP = *slot.
-    // x64 target (hostname CRT / .hexpthk) → LoopTop; ARM64EC → ExitFunctionEC.
+  } else if (B0 == 0xFF && B1 == 0x25 && LoopTop) {
+    // jmp qword [rip+disp32]: load IAT, RIP = *slot, br LoopTop
     const int32_t Disp = static_cast<int32_t>(static_cast<uint32_t>(B2) | (static_cast<uint32_t>(B3) << 8) |
                                               (static_cast<uint32_t>(B4) << 16) | (static_cast<uint32_t>(B5) << 24));
     const uint64_t Slot = GuestRIP + 6 + static_cast<uint64_t>(static_cast<int64_t>(Disp));
-    uint64_t Tgt = 0;
     if (Slot >= 0x10000ull) {
-      Tgt = *reinterpret_cast<const volatile uint64_t*>(Slot);
-    }
-    const uint64_t ExitEC = Frame ? Frame->Pointers.ExitFunctionEC : 0;
-    const bool ToX64 = Tgt >= 0x10000ull && GuestLooksX64(Tgt) && LoopTop;
-    const bool ToEC = Tgt >= 0x10000ull && ExitEC && !ToX64;
-    if (ToX64 || ToEC) {
-      EmitMovAbs(Words, N, 10, Slot); // x10 = IAT slot
-      Words[N++] = 0xF9400149u;       // ldr x9, [x10]
-      Words[N++] = 0xF9000F89u;       // str x9, [x28, #24] RIP
-      if (ToX64) {
-        EmitBrAbs(Words, N, 10, LoopTop);
-      } else {
-        Words[N++] = 0x910002FFu; // mov sp, x23 (guest RSP)
-        EmitBrAbs(Words, N, 10, ExitEC);
-      }
+      EmitMovAbs(Words, N, 10, Slot);
+      Words[N++] = 0xF9400149u; // ldr x9, [x10]
+      Words[N++] = 0xF9000F89u; // str x9, [x28, #24] RIP
+      EmitBrAbs(Words, N, 10, LoopTop);
     }
   }
 
