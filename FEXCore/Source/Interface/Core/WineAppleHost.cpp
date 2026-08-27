@@ -284,6 +284,14 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
       Words[N++] = 0xAA1F03EBu;
       Words[N++] = 0xF900017Fu;
     }
+  } else if (B0 == 0xE9 && LoopTop) {
+    // jmp rel32: RIP = RIP+5+disp32, br LoopTop
+    const int32_t Disp = static_cast<int32_t>(static_cast<uint32_t>(B1) | (static_cast<uint32_t>(B2) << 8) |
+                                              (static_cast<uint32_t>(B3) << 16) | (static_cast<uint32_t>(B4) << 24));
+    const uint64_t Tgt = GuestRIP + 5 + static_cast<uint64_t>(static_cast<int64_t>(Disp));
+    EmitMovAbs(Words, N, 10, Tgt);
+    Words[N++] = 0xF9000F8Au; // str x10, [x28, #24] RIP
+    EmitBrAbs(Words, N, 10, LoopTop);
   } else if (B0 == 0xFF && B1 == 0x25 && LoopTop) {
     // jmp qword [rip+disp32]: load IAT, RIP = *slot, br LoopTop
     const int32_t Disp = static_cast<int32_t>(static_cast<uint32_t>(B2) | (static_cast<uint32_t>(B3) << 8) |
