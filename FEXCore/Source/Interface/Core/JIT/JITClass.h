@@ -532,6 +532,10 @@ private:
   FEXCore::Core::DebugData* DebugData {};
 
   void ResetStack();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // Darwin write(2) from JIT (not ExitFunctionEC). Preserves ARM64EC SRA x0/x1/x2.
+  void EmitWineAppleCtorLog(const char* Msg);
+#endif
   /**
    * @name Relocations
    * @{ */

@@ -12,6 +12,7 @@ $end_info$
 #include "Interface/IR/Passes.h"
 #include "Interface/Core/CPUID.h"
 #include <FEXCore/IR/IR.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Profiler.h>
@@ -565,15 +566,23 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* 
 }
 
 void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+#if !(defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE)
   FEXCORE_PROFILE_SCOPED("PassManager::RA");
+#endif
 
   IREmit = IREmit_;
   auto IR_ = IREmit->ViewIR();
   IR = &IR_;
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("RA: resize\n");
+#endif
   PreferredReg.resize(IR->GetSSACount(), PhysicalRegister::Invalid());
   SSAToReg.resize(IR->GetSSACount(), PhysicalRegister::Invalid());
   Seen.resize(IR->GetSSACount(), false);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("RA: after resize\n");
+#endif
 
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     // Spilling is local, so reset this per-block

@@ -276,6 +276,9 @@ namespace CPU {
   CPUBackend::CPUBackend(CodeBufferManager& CodeBuffers, FEXCore::Core::InternalThreadState* ThreadState)
     : ThreadState(ThreadState)
     , CodeBuffers(CodeBuffers) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CPUBackend: enter\n");
+#endif
 
     auto& Ptrs = ThreadState->CurrentFrame->Pointers;
 
@@ -286,7 +289,9 @@ namespace CPU {
 
     // Copy named vector constants.
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CPUBackend: before HostCopy constants\n");
     FEXCore::Allocator::HostCopy(Ptrs.NamedVectorConstants, NamedVectorConstants, sizeof(NamedVectorConstants));
+    FEXCore::Allocator::CtorLog("CPUBackend: after HostCopy constants\n");
 #else
     memcpy(Ptrs.NamedVectorConstants, NamedVectorConstants, sizeof(NamedVectorConstants));
 #endif
@@ -313,6 +318,9 @@ namespace CPU {
       auto& Telem = FEXCore::Telemetry::GetTelemetryValue(static_cast<FEXCore::Telemetry::TelemetryType>(i));
       Ptrs.TelemetryValueAddresses[i] = reinterpret_cast<uint64_t>(&Telem);
     }
+#endif
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CPUBackend: done\n");
 #endif
   }
 
@@ -354,7 +362,13 @@ namespace CPU {
 
   CodeBuffer::CodeBuffer(size_t Size)
     : AllocatedSize(Size) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CodeBuffer: enter\n");
+#endif
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CodeBuffer: after VirtualAlloc\n");
+#endif
     LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
     // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
@@ -369,7 +383,13 @@ namespace CPU {
     // Huge-pages reduce the amount of iTLB misses dramatically when it works.
     FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<void*>(Ptr), Size, FEXCore::Allocator::THPControl::Enable);
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CodeBuffer: before GuestToHostMap\n");
+#endif
     LookupCache = fextl::make_unique<GuestToHostMap>();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CodeBuffer: done\n");
+#endif
   }
 
   CodeBuffer::~CodeBuffer() {
@@ -402,14 +422,25 @@ namespace CPU {
     }
 #endif
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CodeBufferManager: AllocateNew\n");
+#endif
     auto Buffer = fextl::make_shared<CodeBuffer>(Size);
-
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("CodeBufferManager: after make_shared\n");
+    Latest = Buffer;
+    LatestOffset = 0;
+    // OnCodeBufferAllocated: mutex + vector emplace of shared_ptr (memcpy/exit-thunk).
+    FEXCore::Allocator::CtorLog("CodeBufferManager: skip OnCodeBufferAllocated\n");
+    return Buffer;
+#else
     Latest = Buffer;
     LatestOffset = 0;
 
     OnCodeBufferAllocated(Buffer);
 
     return Buffer;
+#endif
   }
 
   fextl::shared_ptr<CodeBuffer> CodeBufferManager::GetLatest() {

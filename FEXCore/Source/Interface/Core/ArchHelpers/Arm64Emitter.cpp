@@ -5,6 +5,7 @@
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
@@ -364,6 +365,9 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
   , Simulator {&SimDecoder, stdout, vixl::aarch64::SimStack(SimulatorStackSize).Allocate()}
 #endif
 {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("Arm64Emitter: enter\n");
+#endif
 #ifdef VIXL_SIMULATOR
   FEX_CONFIG_OPT(ForceSVEWidth, FORCESVEWIDTH);
   // Hardcode a 256-bit vector width if we are running in the simulator.
@@ -384,6 +388,17 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
 #endif
 
   // Number of register available is dependent on what operating mode the proccess is in.
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // ARM64EC Wine-apple is always x64 SRA. Skip Config.Is64BitMode() (Getter
+  // construction is already done; operator() is fine, but keep the path ARM64-only).
+  StaticRegisters = x64::SRA;
+  GeneralRegisters = x64::RA;
+  GeneralRegistersNotPreserved = x64::NotPreserved_Dynamic;
+  StaticFPRegisters = x64::SRAFPR;
+  GeneralFPRegisters = x64::RAFPR;
+  PairRegisters = x64::RAPairs;
+  FEXCore::Allocator::CtorLog("Arm64Emitter: done\n");
+#else
   if (EmitterCTX->Config.Is64BitMode()) {
     StaticRegisters = x64::SRA;
     GeneralRegisters = x64::RA;
@@ -401,6 +416,7 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
     StaticFPRegisters = x32::SRAFPR;
     GeneralFPRegisters = x32::RAFPR;
   }
+#endif
 }
 
 FEXCore::X86State::X86Reg Arm64Emitter::GetX86RegRelationToARMReg(ARMEmitter::Register Reg) {

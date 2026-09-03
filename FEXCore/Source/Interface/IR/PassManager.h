@@ -57,6 +57,11 @@ public:
 
   void InsertRegisterAllocationPass(FEXCore::Context::ContextImpl* ctx);
 
+  // Pointer stored at insert — no fextl::string / dynamic_cast (ARM64EC exit-thunk).
+  Pass* GetRAPass() {
+    return RAPassStored;
+  }
+
   void Run(IREmitter* IREmit);
 
   bool HasPass(fextl::string Name) const {
@@ -89,6 +94,7 @@ private:
   }
   PassArrayType Passes;
   fextl::unordered_map<fextl::string, Pass*> NameToPassMaping;
+  Pass* RAPassStored {};
 
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   fextl::vector<fextl::unique_ptr<Pass>> ValidationPasses;

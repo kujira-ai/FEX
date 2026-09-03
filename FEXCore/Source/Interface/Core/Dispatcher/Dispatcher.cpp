@@ -15,6 +15,7 @@
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/Event.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
@@ -30,11 +31,103 @@
 #include <cstdio>
 #include <cstring>
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+extern "C" uint64_t FEXWineAppleLastCallRetPeek();
+#endif
+
 namespace FEXCore::CPU {
 
 static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuStateFrame* Frame) {
   CTX->SyscallHandler->SleepThread(CTX, Frame);
 }
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+// s58: LoopTop/EnterECFillSRA RIP crumb. Caller saves SRA/TMPs, then blr here.
+// RIP in x0 (C ABI after save). x10 (TMP1) also holds RIP — ARM64EC-safe, not SRA.
+static void WineAppleLogDispatcherRip(uint64_t Rip, uint64_t Tag, uint64_t Extra) {
+  // Prefer x10 (TMP1, not SRA) if the custom arg survived the prologue.
+  uint64_t RipX10 = 0;
+  __asm__ volatile("mov %0, x10" : "=r"(RipX10));
+  if (RipX10 >= 0x140000000ull && RipX10 < 0x140100000ull) {
+    Rip = RipX10;
+  }
+  // s59/s60: G16 crumbs fire only for 0x1400013ff. Earlier LT rips stay quiet.
+  if (Tag >= 2) {
+    if (Rip != 0x1400013ffull) {
+      return;
+    }
+    if (Tag == 2) {
+      FEXCore::Allocator::CtorLog("LT: 13ff x64\n");
+      return;
+    }
+    if (Tag == 3) {
+      FEXCore::Allocator::CtorLog("LT: 13ff ec\n");
+      return;
+    }
+    if (Tag == 4) {
+      FEXCore::Allocator::CtorLog("LT: 13ff hit\n");
+      return;
+    }
+    if (Tag == 5) {
+      FEXCore::Allocator::CtorLog("LT: 13ff noblock\n");
+      return;
+    }
+    // s60: G16 walk crumbs. Extra is TMP1 at the log site (lsr#40 / PEB / map / byte).
+    char Line[48];
+    size_t I = 0;
+    const char* Pfx = nullptr;
+    int HexDigits = 0;
+    if (Tag == 6) {
+      Pfx = "LT: 13ff teb ";
+      Extra = Extra ? 1 : 0;
+      HexDigits = 1;
+    } else if (Tag == 7) {
+      Pfx = "LT: 13ff tebok\n";
+    } else if (Tag == 8) {
+      Pfx = "LT: 13ff peb\n";
+    } else if (Tag == 9) {
+      Pfx = "LT: 13ff map ";
+      HexDigits = 16;
+    } else if (Tag == 10) {
+      Pfx = "LT: 13ff nullmap\n";
+    } else if (Tag == 11) {
+      Pfx = "LT: 13ff b0 ";
+      Extra &= 0xff;
+      HexDigits = 2;
+    } else {
+      return;
+    }
+    while (Pfx[I]) {
+      Line[I] = Pfx[I];
+      ++I;
+    }
+    if (HexDigits) {
+      for (int B = HexDigits - 1; B >= 0; --B) {
+        const unsigned N = static_cast<unsigned>((Extra >> (B * 4)) & 0xf);
+        Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+      }
+      Line[I++] = '\n';
+    }
+    Line[I] = 0;
+    FEXCore::Allocator::CtorLog(Line);
+    return;
+  }
+  char Line[40];
+  size_t I = 0;
+  const char* Pfx = Tag ? "FS: rip " : "LT: rip ";
+  while (Pfx[I]) {
+    Line[I] = Pfx[I];
+    ++I;
+  }
+  for (int B = 15; B >= 0; --B) {
+    const unsigned N = static_cast<unsigned>((Rip >> (B * 4)) & 0xf);
+    Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+  }
+  Line[I++] = '\n';
+  Line[I] = 0;
+  FEXCore::Allocator::CtorLog(Line);
+}
+#endif
 
 constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
 
@@ -135,6 +228,13 @@ void Dispatcher::EmitDispatcher() {
 #endif
   // Don't modify TMP3 since it contains our RIP once the block doesn't exist
   auto RipReg = TMP3;
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  auto EmitRipCtorLog = [&](uint64_t Tag) {
+    // s74: skip. 144-byte stp overlays guest CALL return slot (s73: x17 at SP+104).
+    (void)Tag;
+    (void)&WineAppleLogDispatcherRip;
+  };
+#endif
 #ifdef VIXL_DISASSEMBLER
   const auto DisasmBegin = GetCursorAddress<const vixl::aarch64::Instruction*>();
 #endif
@@ -170,37 +270,60 @@ void Dispatcher::EmitDispatcher() {
   ARMEmitter::ForwardLabel CompileSingleStep;
   AbsoluteLoopTopAddressFillSRA = GetCursorAddress<uint64_t>();
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // s140; s139 LoopTop >>32==0 REVERT 127e; s138 FAR 0x1ce8; save callret before Fill;
+  // always restore after native; do not skip Fill; do not touch LoopTop.
+  ldr(TMP1, STATE_PTR(CpuStateFrame, State.WineAppleCallRet));
+  str<ARMEmitter::IndexType::PRE>(TMP1, ARMEmitter::Reg::rsp, -16);
+#endif
   FillStaticRegs();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  ldr<ARMEmitter::IndexType::POST>(TMP1, ARMEmitter::Reg::rsp, 16);
+  {
+    ARMEmitter::ForwardLabel l_ok;
+    lsr(ARMEmitter::Size::i64Bit, TMP2, TMP1, 32);
+    sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &l_ok); // saved callret not hostname-shaped
+    str(TMP1, STATE_PTR(CpuStateFrame, State.rip));
+    (void)Bind(&l_ok);
+  }
+#endif
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
   (void)cbnz(ARMEmitter::Size::i32Bit, ENTRY_FILL_SRA_SINGLE_INST_REG, &CompileSingleStep);
 
   ARMEmitter::BiDirectionalLabel LoopTop {};
+  ARMEmitter::BiDirectionalLabel NoBlock {};
 
 #ifdef ARCHITECTURE_arm64ec
   (void)b(&LoopTop);
 
   AbsoluteLoopTopAddressEnterECFillSRA = GetCursorAddress<uint64_t>();
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // Gate lt: FillStaticRegs ldr [x18,#0x1788] wants CPUArea (not TEB via tpidr).
-  // x17 is CPUArea on FillSRA entry. x18 := x17 - 0x1788. Not mrs tpidr (ls/lq).
-  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, TEB_CPU_AREA_OFFSET);
-  sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r18, ARMEmitter::Reg::r17, TMP1);
-#endif
+  // EnterEC already stored x9 into State.rip. Live ARM64EC GPRs *are* x64 SRA.
+  // Do not derive TEB as CPUArea-0x1788: x17 is often emulator-stack, which
+  // poisoned tpidr (exp-jit1s9 addr 0x368). TEB lives in State.gs_cached.
   ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
-#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // Gate lv: named insn was FillStaticRegs ldr STATE,[Tmp,#0x30] (Tmp=InSimulation).
+  ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
+  EmitRipCtorLog(1); // FS: EnterECFillSRA
+  ldr(ARMEmitter::XReg::x18, STATE_PTR(CpuStateFrame, State.gs_cached));
+  lsr(ARMEmitter::Size::i64Bit, TMP1, ARMEmitter::XReg::x18, 40);
+  ARMEmitter::ForwardLabel l_SkipTpidr;
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_SkipTpidr);
+  msr(ARMEmitter::SystemRegister::TPIDR_EL0, ARMEmitter::XReg::x18);
+  (void)Bind(&l_SkipTpidr);
+  // Live x23 is not guest RSP after BeginSim C++. Frame has Context.Rsp
+  // (BeforeNative rsp=0x107ea0000). Fill from CPUArea STATE so push does
+  // not store to [xzr, #-8] (exp-jit1s16).
   FillStaticRegs({.ECStateFromCpuArea = true});
+  // s41: RIP from guest stack, AfterNative still never CB: pre. Skip LoopTop G16.
+  (void)b(&NoBlock);
 #else
+  ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
   FillStaticRegs();
-#endif
 
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
-#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // G3t: x11=TMP2 leftover after FillSRA → cbnz took CSS SGR (FAR 0x2).
-  // Same 4B: CBNZ → B LoopTop. Do not skip CSS SGR (G3s hexpthk).
-  (void)b(&LoopTop);
-#else
-  // Force a single instruction block if ENTRY_FILL_SRA_SINGLE_INST_REG is nonzero entering the JIT, used for inline SMC handling.
+#endif
+#if !defined(FEX_ON_WINE_APPLE) || !FEX_ON_WINE_APPLE
   (void)cbnz(ARMEmitter::Size::i32Bit, ENTRY_FILL_SRA_SINGLE_INST_REG, &CompileSingleStep);
 #endif
 
@@ -249,6 +372,44 @@ void Dispatcher::EmitDispatcher() {
 
   // Load in our RIP
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  EmitRipCtorLog(0); // LT: LoopTop
+  // s143; s142 KEEP-as-diagnosis FAR 0xd61f0160 br x11; replace lsr#16; do not add LoopTop compares; do not retry s139 extra cbz.
+  // s141; s140 KEEP FAR 0x1234; replace RIP<=1; do not add LoopTop compares;
+  // do not retry s139 >>32==0.
+  // s138; s137 KEEP FAR 0x1 G16 ldrb; do not retry s136 >>32==3.
+  // s134; s133 KEEP 2121 gone; SIGBUS execute 0x10d003fe0; do not lsr#36.
+  // s133: RIP==0 OR (RIP>>48)!=0 OR (RIP>>32)==0xa; callret iff >>32==1.
+  // s134: also try-reload when (RIP>>28)==0x10 (stack 0x10xxxxxxx).
+  // s143: 32-bit-only RIP via lsr#32/cbz (was s141 lsr#16); 0xd61f0160>>32==0; hostname 0x14000xxxx>>32==1 still fails.
+  // Hostname 0x14000xxxx>>28==0x14 still hits l_RipOk. ntdll 0x6ffff… kept.
+  // s139 (RIP>>32)==0 try-reload reverted (127e SIGBUS; 8× SJ; FAR 6ffffdfb87b3 like s136).
+  // Accept callret only if (callret>>32)==1. No LoadConstant. No peek.
+  // s135 invert KEEP-only-when >>28==0x14 reverted (0x SJ; FAR 13ed like s131).
+  // s136 (RIP>>32)==3 try-reload reverted (127e SIGBUS; 8× SJ; FAR 6ffffdfb87b3 like s127).
+  {
+    ARMEmitter::ForwardLabel l_RipOk;
+    ARMEmitter::ForwardLabel l_Try;
+    lsr(ARMEmitter::Size::i64Bit, TMP1, RipReg, 32);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_Try); // s143 32-bit-only RIP (0, 1, 0x1234, 0x1ce8, 0xd61f0160)
+    lsr(ARMEmitter::Size::i64Bit, TMP1, RipReg, 48);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_Try); // s133 non-canonical 0x2121…
+    lsr(ARMEmitter::Size::i64Bit, TMP1, RipReg, 28);
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x10); // (RIP>>28)==0x10 ?
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_Try); // s134 stack 0x10xxxxxxx
+    lsr(ARMEmitter::Size::i64Bit, TMP1, RipReg, 32);
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0xa); // (RIP>>32)==0xa ?
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_RipOk); // hostname 0x14000… / ntdll: keep
+    (void)Bind(&l_Try);
+    ldr(TMP2, STATE_PTR(CpuStateFrame, State.WineAppleCallRet));
+    lsr(ARMEmitter::Size::i64Bit, TMP1, TMP2, 32);
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1); // callret>>32 == 1 (0x140000000..0x1ffffffff)
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_RipOk);
+    mov(RipReg, TMP2);
+    str(RipReg, STATE_PTR(CpuStateFrame, State.rip));
+    (void)Bind(&l_RipOk);
+  }
+#endif
 
 #ifdef ARCHITECTURE_arm64ec
   // Clobbers TMP1/2
@@ -259,10 +420,18 @@ void Dispatcher::EmitDispatcher() {
   ARMEmitter::ForwardLabel l_NotFF25;
 #endif
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  // G3u: x18=0 after FillSRA (lt fake-TEB clobbered). PEB from tpidr, not x18.
-  // Do not write x18. Do not drop lt. Not lu (that overwrote LoopTop only after 0x31).
-  mrs(ARMEmitter::Reg::r11, ARMEmitter::SystemRegister::TPIDR_EL0);
+  // TEB from Frame->gs_cached (ThreadInit). lsr #40 rejects 4GB junk (0x105e9e878)
+  // that still passes lsr #32. If missing, NULL-map path — no PEB deref.
+  ldr(ARMEmitter::XReg::x11, STATE_PTR(CpuStateFrame, State.gs_cached));
+  lsr(ARMEmitter::Size::i64Bit, TMP1, ARMEmitter::XReg::x11, 40);
+  ARMEmitter::ForwardLabel l_TebOk;
+  EmitRipCtorLog(6); // s60: LT: 13ff teb (Extra=TMP1, #40==0?)
+  (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_TebOk);
+  (void)b(&l_NullMap);
+  (void)Bind(&l_TebOk);
+  EmitRipCtorLog(7); // s60: LT: 13ff tebok
   ldr(TMP1, TMP2, TEB_PEB_OFFSET);
+  EmitRipCtorLog(8); // s60: LT: 13ff peb
 #else
   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
 #endif
@@ -270,6 +439,7 @@ void Dispatcher::EmitDispatcher() {
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
   // NULL map: do not treat as all-x64. ntdll arm64x_check_call follows ff 25 as
   // IAT then ExitFunctionEC for ARM64EC bodies (G16).
+  EmitRipCtorLog(9); // s60: LT: 13ff map (Extra=bitmap ptr)
   (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NullMap);
 #endif
 
@@ -280,20 +450,50 @@ void Dispatcher::EmitDispatcher() {
   lsrv(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
   (void)tbz(TMP1, 0, &l_NotECCode);
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  {
+    ARMEmitter::ForwardLabel l_PinTeb1;
+    ldr(ARMEmitter::XReg::x18, STATE_PTR(CpuStateFrame, State.gs_cached));
+    lsr(ARMEmitter::Size::i64Bit, TMP1, ARMEmitter::XReg::x18, 40);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_PinTeb1);
+    msr(ARMEmitter::SystemRegister::TPIDR_EL0, ARMEmitter::XReg::x18);
+    ldr(TMP1, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_PinTeb1);
+    ldr(STATE, TMP1, CPU_AREA_EMULATOR_DATA_OFFSET);
+    (void)Bind(&l_PinTeb1);
+  }
+#endif
+  SpillStaticRegs(TMP4);
   str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
 
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
   mov(EC_CALL_CHECKER_PC_REG, RipReg);
   ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  EmitRipCtorLog(3); // s59: LT: 13ff ec
+#endif
   br(TMP2);
 
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
   (void)Bind(&l_NullMap);
+  EmitRipCtorLog(10); // s60: LT: 13ff nullmap
   ldrb(TMP1.W(), RipReg, 0);
+  EmitRipCtorLog(11); // s60: LT: 13ff b0 (Extra=first byte)
   cmp(ARMEmitter::Size::i32Bit, TMP1, 0xff);
   (void)b(ARMEmitter::Condition::CC_NE, &l_NotFF25);
   ldrb(TMP2.W(), RipReg, 1);
   cmp(ARMEmitter::Size::i32Bit, TMP2, 0x25);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  cmp(ARMEmitter::Size::i32Bit, TMP2, 0x15);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s66: FF C1 at 0x14000141e (inc ecx) was G16-miss → Spill/ExitFunctionEC write@0.
+  // Second-byte C1 only. Do not treat remaining FF as x64 (s65: ARM ucrtbase 497d4).
+  // l_NotECCode refs 15→16; extras=16 unused slots remain (16/17 = FirstInst+15 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP2, 0xc1);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s119: FF E0 at 0x140001657 (jmp rax) was G16-miss → SIGBUS pc=1657.
+  // Second-byte E0 only. Do not treat remaining FF as x64 (s65: ARM ucrtbase).
+  cmp(ARMEmitter::Size::i32Bit, TMP2, 0xe0);
   (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
   (void)Bind(&l_NotFF25);
   // x64: REX/PUSH/POP 40-5f, 66, 90, B8-BF, E8/E9. ARM64 body (e.g. FF 83) falls through.
@@ -311,20 +511,88 @@ void Dispatcher::EmitDispatcher() {
   (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
   cmp(ARMEmitter::Size::i32Bit, TMP1, 0xe9);
   (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s35: 8B 30 at 0x1400013ed (mov esi,[rax]) was G16-miss → br x9 as ARM64.
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x8b);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x89);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s43: 65 48 8B 04 25 30 at 0x1400013ff (mov rax, gs:[30h]) was G16-miss.
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x65);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x64);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s63: 31 C9 at 0x140001413 (xor ecx,ecx) was G16-miss → Spill/ExitFunctionEC write@0.
+  // One first-byte only. l_NotECCode refs 13→14; extras=16 still has unused slots.
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x31);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s64: 0F 94 C1 at 0x14000141b (sete cl) was G16-miss → Spill/ExitFunctionEC write@0.
+  // Two-byte opcode map (SETcc/CMOV/etc). One first-byte only.
+  // l_NotECCode refs 14→15; extras=16 unused slots remain (15/17 = FirstInst+14 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x0f);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s67: 72 18 at 0x140001399 (jb rel8) was G16-miss → Spill/ExitFunctionEC write@0.
+  // One first-byte only (jb). Do not add 70–7F jcc pack (s65: wide first-byte classes JIT ARM).
+  // l_NotECCode refs 16→17; extras=16 last extra slot (17/17 = FirstInst+16 extras). At the cap.
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x72);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s69: C3 CC at 0x1400013bb (ret) was G16-miss → Spill/ExitFunctionEC write@0.
+  // One first-byte only (ret). Do not add C2 (ret imm16) or CC (int3).
+  // l_NotECCode refs 17→18; extras=32 unused slots remain (18/33 = FirstInst+17 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0xc3);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s76: 77 E8 at 0x1400013b1 (ja rel8) was G16-miss → Spill/ExitFunctionEC SIGBUS.
+  // One first-byte only (ja). Do not add 70–7F jcc pack.
+  // l_NotECCode refs 18→19; extras=32 unused slots remain (19/33 = FirstInst+18 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x77);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s83: 83 F9 02 at 0x140001022 (cmp ecx,2). One first-byte only.
+  // l_NotECCode refs 19→20; extras=32 unused remain (20/33 = FirstInst+19 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x83);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s84: 7C 58 at 0x140001025 (jl rel8). One first-byte only.
+  // l_NotECCode refs 20→21; extras=32 unused remain (21/33 = FirstInst+20 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x7c);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s90: C7 44 24 2C at 0x14000107f (mov dword [rsp+2ch],10h). One first-byte only.
+  // Do not add C6. Do not add 70–7F pack.
+  // l_NotECCode refs 21→22; extras=32 unused remain (22/33 = FirstInst+21 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0xc7);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+  // s91: 74 15 at 0x140001099 (jz rel8). One first-byte only.
+  // Do not add 70–7F jcc pack.
+  // l_NotECCode refs 22→23; extras=32 unused remain (23/33 = FirstInst+22 extras).
+  cmp(ARMEmitter::Size::i32Bit, TMP1, 0x74);
+  (void)b(ARMEmitter::Condition::CC_EQ, &l_NotECCode);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  {
+    ARMEmitter::ForwardLabel l_PinTeb2;
+    ldr(ARMEmitter::XReg::x18, STATE_PTR(CpuStateFrame, State.gs_cached));
+    lsr(ARMEmitter::Size::i64Bit, TMP1, ARMEmitter::XReg::x18, 40);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_PinTeb2);
+    msr(ARMEmitter::SystemRegister::TPIDR_EL0, ARMEmitter::XReg::x18);
+    ldr(TMP1, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_PinTeb2);
+    ldr(STATE, TMP1, CPU_AREA_EMULATOR_DATA_OFFSET);
+    (void)Bind(&l_PinTeb2);
+  }
+#endif
+  SpillStaticRegs(TMP4);
   str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
   mov(EC_CALL_CHECKER_PC_REG, RipReg);
   ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
+  EmitRipCtorLog(3); // s59: LT: 13ff ec
   br(TMP2);
 #endif
 
   (void)Bind(&l_NotECCode);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  EmitRipCtorLog(2); // s59: LT: 13ff x64
+#endif
 #endif
 
   ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
   (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &CompileSingleStep);
-
-  ARMEmitter::ForwardLabel NoBlock;
 
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
   // L2Pointer is 0 until LookupCache constructs.
@@ -388,6 +656,9 @@ void Dispatcher::EmitDispatcher() {
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
 
         // Jump to the block
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+        EmitRipCtorLog(4); // s59: LT: 13ff hit
+#endif
         br(TMP4);
       }
     }
@@ -466,9 +737,19 @@ void Dispatcher::EmitDispatcher() {
   // Need to create the block
   {
     (void)Bind(&NoBlock);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    EmitRipCtorLog(5); // s59: LT: 13ff noblock
+#endif
 
     auto NoBlockBody = [&]() {
       SpillStaticRegs(TMP1);
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+      // s81: 16-align ARM SP down from guest RSP SRA before C++ CompileBlock.
+      // s80 ExitFunction mov sp did not change 138c asp (still fec0).
+      bic(ARMEmitter::Size::i64Bit, TMP1, StaticRegisters[X86State::REG_RSP], 0xf);
+      mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, TMP1);
+#endif
 
       if (!TMP_ABIARGS) {
         mov(ARMEmitter::XReg::x2, RipReg);
@@ -487,11 +768,19 @@ void Dispatcher::EmitDispatcher() {
       }
 
       // Result is now in x0
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+      // s97: CodePtr lives on CpuStateFrame (C++ stores it). After Fill, x28
+      // STATE is valid; ldr not [sp] (s54 shared stack / s95 2nd 13bb) and not
+      // x24 (s96 br pc=0). Fill must still run.
+      FillStaticRegs();
+      ldr(TMP1, STATE_PTR(CpuStateFrame, WineAppleCodePtr));
+#else
       if (!TMP_ABIARGS) {
         mov(TMP1, ARMEmitter::XReg::x0);
       }
 
       FillStaticRegs();
+#endif
     };
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
     // G3r: skip NoBlock SGR (G3o shape). Prove 0x330 != ldr [x18,#0x1788].

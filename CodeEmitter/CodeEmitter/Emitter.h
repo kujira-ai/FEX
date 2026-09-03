@@ -551,8 +551,12 @@ struct ForwardLabel {
 
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
   // wine-apple: fextl::vector push_back during EmitDispatcher multi-branch fixup
-  // faults (InitCore c000001d). Fixed stack slots — L2 walk needs ≤3 extras.
-  static constexpr size_t kMaxExtraInsts = 8;
+  // faults (InitCore c000001d). Fixed stack slots. s62: extras=8 silently dropped
+  // 8B/89/65/64 — unbound b.eq imm19=0 is a self-loop (s60 hang after b0 65).
+  // s67: l_NotECCode 17 forward refs (FirstInst + 16 extras). extras=16 last
+  // extra slot used (17/17). s68: cap 16→32 so the 18th ref (C3, not added here)
+  // can bind later. Do not drop on overflow. Do not revert the cap.
+  static constexpr size_t kMaxExtraInsts = 32;
   Reference ExtraInsts[kMaxExtraInsts] {};
   size_t ExtraCount = 0;
 #else
@@ -576,6 +580,8 @@ static inline void AddLocationToLabel(ForwardLabel* Label, ForwardLabel::Referen
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
     if (Label->ExtraCount < ForwardLabel::kMaxExtraInsts) {
       Label->ExtraInsts[Label->ExtraCount++] = Location;
+    } else {
+      LOGMAN_MSG_A_FMT("wine-apple ForwardLabel ExtraInsts overflow kMaxExtraInsts={}", ForwardLabel::kMaxExtraInsts);
     }
 #else
     Label->Insts.push_back(Location);

@@ -1179,7 +1179,7 @@ void Decoder::BranchTargetInMultiblockRange() {
     // NULL EcBitMap: ntdll RtlIsEcCode is false. Do not pull ARM64 into a block.
     const auto* P = reinterpret_cast<const uint8_t*>(TargetRIP);
     const uint8_t B = P[0];
-    const bool LooksX64 = (B == 0xff && P[1] == 0x25) || (B >= 0x40 && B <= 0x5f) || B == 0x66 || B == 0x90 ||
+    const bool LooksX64 = (B == 0xff && (P[1] == 0x25 || P[1] == 0x15)) || (B >= 0x40 && B <= 0x5f) || B == 0x66 || B == 0x90 ||
                           (B >= 0xb8 && B <= 0xbf) || B == 0xe8 || B == 0xe9 || B == 0x0f || B == 0xc3 || B == 0xc2 ||
                           B == 0xc9 || (B >= 0x70 && B <= 0x8b) || B == 0xf2 || B == 0xf3 || B == 0xf0 || B == 0x64 || B == 0x65;
     ValidMultiblockMember = ValidMultiblockMember && LooksX64;

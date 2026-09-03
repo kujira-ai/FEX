@@ -107,7 +107,8 @@ struct alignas(64) CPUState {
   uint64_t L1Pointer {};
   uint64_t L1Mask {};
   uint64_t callret_sp {};
-  uint64_t _pad1 {};
+  // wine-apple: x64 CALL return (GuestRIP+len) for StoreJit. Same slot as old _pad1.
+  uint64_t WineAppleCallRet {};
 
   // Cacheline: 1,2,3,4
   // The high 128-bits of AVX registers when not being emulated by SVE256.
@@ -426,6 +427,9 @@ struct CpuStateFrame {
   // Set by the kernel on ARM64EC whenever the JIT should cooperatively suspend running guest code.
   uint32_t SuspendDoorbell {};
 #endif
+
+  // s97: CompileBlock CodePtr for NoBlock br after Fill. Not in CPUState (do not shift gregs).
+  uint64_t WineAppleCodePtr {};
 
   // Pointers that the JIT needs to load to remove relocations
   JITPointers Pointers;

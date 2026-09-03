@@ -15,9 +15,41 @@ $end_info$
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/MathUtils.h>
 
 namespace FEXCore::CPU {
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+// s70/s71 crumb: guest RSP SRA + [RSP] at CALL 101a / RET 13bb.
+static void WineAppleLogHex4(const char* A, uint64_t VA, const char* B, uint64_t VB, const char* C, uint64_t VC, const char* D, uint64_t VD) {
+  auto Hex = [](const char* Pfx, uint64_t V) {
+    char Line[40];
+    size_t I = 0;
+    while (Pfx[I]) {
+      Line[I] = Pfx[I];
+      ++I;
+    }
+    for (int B = 15; B >= 0; --B) {
+      const unsigned N = static_cast<unsigned>((V >> (B * 4)) & 0xf);
+      Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+    }
+    Line[I++] = '\n';
+    Line[I] = 0;
+    FEXCore::Allocator::CtorLog(Line);
+  };
+  Hex(A, VA);
+  Hex(B, VB);
+  Hex(C, VC);
+  Hex(D, VD);
+}
+static void WineAppleLogCallCrumb(uint64_t Tgt, uint64_t RspSra, uint64_t RspQ, uint64_t Push) {
+  WineAppleLogHex4("call tgt=", Tgt, "call rsp=", RspSra, "call [RSP]=", RspQ, "call push=", Push);
+}
+static void WineAppleLogRetCrumb(uint64_t Tgt, uint64_t RspSra, uint64_t RspQ, uint64_t Callret) {
+  WineAppleLogHex4("ret tgt=", Tgt, "ret rsp=", RspSra, "ret [RSP]=", RspQ, "ret crt=", Callret);
+}
+#endif
 
 DEF_OP(CallbackReturn) {
   // spill back to CTX
@@ -58,12 +90,50 @@ DEF_OP(ExitFunction) {
   {
     uint64_t ImmRIP {};
     if (IsInlineConstant(Op->NewRIP, &ImmRIP) || IsInlineEntrypointOffset(Op->NewRIP, &ImmRIP)) {
+      if (Entry == 0x1400013fcull) {
+        FEXCore::Allocator::CtorLog("13fc ExitFn imm\n");
+        // ImmRIP compile-time: expect 0x1400013ff.
+        char Line[40];
+        size_t I = 0;
+        const char* Pfx = "13fc nr=";
+        while (Pfx[I]) {
+          Line[I] = Pfx[I];
+          ++I;
+        }
+        for (int B = 15; B >= 0; --B) {
+          const unsigned N = static_cast<unsigned>((ImmRIP >> (B * 4)) & 0xf);
+          Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+        }
+        Line[I++] = '\n';
+        Line[I] = 0;
+        FEXCore::Allocator::CtorLog(Line);
+        EmitWineAppleCtorLog("JIT: 13fc exit\n");
+      }
+      if (Entry == 0x14000101aull) {
+        // s75: no runtime 144-byte stp (overlays guest CALL return slot). Emit-time only.
+        FEXCore::Allocator::CtorLog("call 101a jit\n");
+        (void)&WineAppleLogCallCrumb;
+        (void)&WineAppleLogRetCrumb;
+      }
       InsertGuestRIPMove(TMP1, ImmRIP);
       str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
     } else {
+      if (Entry == 0x1400013fcull) {
+        FEXCore::Allocator::CtorLog("13fc ExitFn reg\n");
+        EmitWineAppleCtorLog("JIT: 13fc exit\n");
+      }
       auto RipReg = GetReg(Op->NewRIP);
+      if (Entry == 0x1400013bbull) {
+        // s75: no runtime 144-byte stp (same overlay as CALL crumb).
+        FEXCore::Allocator::CtorLog("ret 13bb jit\n");
+      }
       str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
     }
+    // s80: 16-byte-align ARM SP down from guest RSP SRA. s79 raw `add sp, x23`
+    // copied 8-mod-16 PUSH RSP → SIGBUS on `stp`. After CALL, x23=…ff98 → SP=…ff90
+    // so CompileBlock stays below TOS [ff98].
+    bic(ARMEmitter::Size::i64Bit, TMP1, StaticRegisters[X86State::REG_RSP], 0xf);
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, TMP1);
     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
     br(TMP2);
   }

@@ -40,9 +40,14 @@ DEF_OP(WFET) {
 }
 
 DEF_OP(GuestOpcode) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  (void)IROp;
+  return;
+#else
   auto Op = IROp->C<IR::IROp_GuestOpcode>();
   // metadata
   DebugData->GuestOpcodes.push_back({Op->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
+#endif
 }
 
 DEF_OP(Fence) {

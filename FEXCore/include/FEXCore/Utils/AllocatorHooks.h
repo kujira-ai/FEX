@@ -55,11 +55,36 @@ FEX_DEFAULT_VISIBILITY void VirtualDontNeed(void* Ptr, size_t Size, bool Recommi
 FEX_DEFAULT_VISIBILITY bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options);
 
 // libc memcpy/memset are ARM64EC exit-thunks before the JIT exists.
+// volatile: the compiler must not lower this loop to a memcpy libcall.
 inline void HostCopy(void* Dst, const void* Src, size_t N) {
-  auto* D = static_cast<unsigned char*>(Dst);
-  const auto* S = static_cast<const unsigned char*>(Src);
+  volatile unsigned char* D = static_cast<unsigned char*>(Dst);
+  const volatile unsigned char* S = static_cast<const unsigned char*>(Src);
   for (size_t I = 0; I < N; ++I) {
     D[I] = S[I];
+  }
+}
+
+// Direct Darwin write(2) — no CRT, no Wine log, survives pre-JIT.
+inline void CtorLog(const char* Msg) {
+  size_t Len = 0;
+  const volatile char* P = Msg;
+  while (P[Len]) {
+    ++Len;
+  }
+  uintptr_t SavedTeb {}, SavedX18 {};
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(SavedTeb)::"memory");
+  __asm__ volatile("mov %0, x18" : "=r"(SavedX18));
+  register uint64_t x0 __asm__("x0") = 2;
+  register uint64_t x1 __asm__("x1") = reinterpret_cast<uint64_t>(Msg);
+  register uint64_t x2 __asm__("x2") = static_cast<uint64_t>(Len);
+  register uint64_t x16 __asm__("x16") = 4;
+  __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "x18");
+  uintptr_t Restore = SavedTeb;
+  if (Restore < 0x10000ull || (Restore & 0xFull)) {
+    Restore = SavedX18;
+  }
+  if (Restore >= 0x10000ull && !(Restore & 0xFull)) {
+    __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
   }
 }
 #else

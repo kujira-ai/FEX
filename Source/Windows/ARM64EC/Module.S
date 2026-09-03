@@ -85,13 +85,48 @@ enter_jit:
 // Native ARM64 ret after ExitFunctionEC: Frame->rip is the x64 caller. FillSRA.
 .globl WineAppleAfterNative
 WineAppleAfterNative:
+  // Prefer live x18 if it looks like a TEB. Native CRT/unix leaves Darwin tpidr.
+  lsr x16, x18, #40
+  cbnz x16, 1f
   mrs x18, tpidr_el0
+1:
+  lsr x16, x18, #40
+  cbz x16, 9f
+  msr tpidr_el0, x18
+  // s34: CPUArea from ThreadInit host slab. TEB+0x1788 is not a reliable CPUArea.
+  // s156: native ARM64EC return is x0. bl FEXGetWineAppleCpuArea clobbers it
+  // (WCTMB size / WriteConsoleW eax). Save on this frame; store to
+  // Frame.gregs[RAX] (+0x20) before FillSRA. Not Core.cpp. Not r8 poke.
+  sub sp, sp, #0x40
+  str x18, [sp, #0x30]
+  str x0, [sp, #0x28]
+  bl "#FEXGetWineAppleCpuArea"
+  ldr x18, [sp, #0x30]
+  ldr x16, [sp, #0x28]
+  add sp, sp, #0x40
+  msr tpidr_el0, x18
+  cbz x0, 10f
+  mov x17, x0
+  b 11f
+10:
   ldr x17, [x18, #0x1788]
   cbz x17, 9f
+11:
+  ldr x14, [x17, #0x30]
+  cbz x14, .Lwa_an_fill
+  str x16, [x14, #0x20]
+.Lwa_an_fill:
   mov w16, #1
   strb w16, [x17]
-  adrp x16, WineAppleRealFillSRA
-  ldr x16, [x16, :lo12:WineAppleRealFillSRA]
+  // s126: restore Frame.rip from LastCallRet before FillSRA (AfterNative/Fill
+  // leaves Frame.rip and WineAppleCallRet 0). Do not skip Fill (br x16 stays).
+  sub sp, sp, #0x40
+  stp x17, x18, [sp, #0x30]
+  mov x0, x17
+  bl "#FEXWineAppleFixRip0FromArea"
+  ldp x17, x18, [sp, #0x30]
+  add sp, sp, #0x40
+  ldr x16, [x17, #0x48]          // EmulatorData[3] FillSRA — never PE .data
   cbz x16, 9f
   br x16
 9:
@@ -100,35 +135,59 @@ WineAppleAfterNative:
 // EP looks like x64 → FillSRA. ARM64EC wineboot/start (adrp/stp) ret native.
 // No C/svc (BeginSim saves ntdll Rip in x4; C would clobber). x17=CPUArea*, x9=EP.
 .globl WineAppleEnterEC
-.extern WineAppleRealFillSRA
 WineAppleEnterEC:
   ldr x16, [x17, #0x30]          // StateFrame
-  cbz x16, 1f
+  cbz x16, 8f
+  lsr x15, x9, #16               // reject RIP < 0x10000
+  cbz x15, 8f
   str x9, [x16, #0x18]           // State.rip
-1:
   ldrb w16, [x9]
   cmp w16, #0x90
   b.eq 5f
   cmp w16, #0x66
   b.eq 5f
-  cmp w16, #0x48
-  b.eq 5f
   cmp w16, #0xe8
   b.eq 5f
   cmp w16, #0xe9
   b.eq 5f
-  sub w15, w16, #0x40
-  cmp w15, #0x18                 // 0x40–0x57 REX / PUSH r64
-  b.hs 8f
+  sub w15, w16, #0x50            // PUSH/POP 50-5F
+  cmp w15, #0x10
+  b.lo 5f
+  sub w15, w16, #0xb8            // mov r32,imm32 B8-BF
+  cmp w15, #0x8
+  b.lo 5f
+  cmp w16, #0xff                 // FF 25 jmp / FF 15 call [rip+disp32]
+  b.ne 2f
+  ldrb w15, [x9, #1]
+  cmp w15, #0x25
+  b.eq 5f
+  cmp w15, #0x15
+  b.eq 5f
+  b 8f
+2:
+  cmp w16, #0x8b                 // mov r32, r/m32 (s35 8B 30 at 0x1400013ed)
+  b.eq 5f
+  cmp w16, #0x89                 // mov r/m32, r32
+  b.eq 5f
+  cmp w16, #0x48                 // REX.W + known opcode (not any 0x40-57)
+  b.ne 8f
+  ldrb w15, [x9, #1]
+  cmp w15, #0x83
+  b.eq 5f
+  cmp w15, #0x89
+  b.eq 5f
+  cmp w15, #0x8b
+  b.eq 5f
+  cmp w15, #0x8d
+  b.eq 5f
+  cmp w15, #0x81
+  b.eq 5f
+  b 8f
 5:
   mov w16, #1
   strb w16, [x17]                // InSimulation
-  adrp x16, WineAppleRealFillSRA
-  ldr x16, [x16, :lo12:WineAppleRealFillSRA]
-  cbnz x16, 6f
-  ldr x16, [x17, #0x48]
+  ldr x16, [x17, #0x48]          // EmulatorData[3] FillSRA
   cbz x16, 8f
-6:
   br x16
 8:
   ret
@@ -210,42 +269,156 @@ BeginSimulation:
 .global ExitFunctionEC
 ExitFunctionEC:
 #ifdef FEX_ON_WINE_APPLE
-  // x9 = ARM64 target. Save it and the x64 return before any C (StoreJit clobbers x9).
-  ldr x16, [sp], #8
+  // x9 = ARM64 target. Save it before any C (StoreJit clobbers x9).
+  // s35 skip-pop when x30 in AfterNative. s42: x30=JIT still hit f84087f0
+  // write@0, and ARM-SP pop of a stale 0x14000… overwrote StoreJit RIP
+  // (5th SJ was _initialize again). Guest return is StoreJit [RSP] only.
+  // Never pop ARM SP here (wine-apple DispatchJump does not push lr).
+  mov x16, xzr
+21:
   mov x15, sp
   bic x15, x15, #0xf
   mov sp, x15
   stp x9, x16, [sp, #-16]!
+  // LoopTop may have pinned x18=TEB. Do not mrs Darwin tpidr over it.
+  lsr x17, x18, #40
+  cbnz x17, 4f
+  mrs x17, tpidr_el0
+  lsr x15, x17, #40
+  cbz x15, 4f
+  mov x18, x17
+4:
+  lsr x17, x18, #40
+  cbz x17, 5f
+  msr tpidr_el0, x18
+5:
 #endif
+#ifndef FEX_ON_WINE_APPLE
   mrs x18, tpidr_el0
+#endif
   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
   mrs x17, fpcr
   and x17, x17, #~6 // NEP + AH
   msr fpcr, x17
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#ifdef FEX_ON_WINE_APPLE
+  // s34: host-slab CPUArea wins over leftover x17 / TEB+0x1788.
+  sub sp, sp, #0x40
+  str x18, [sp, #0x30]
+  bl "#FEXGetWineAppleCpuArea"
+  ldr x18, [sp, #0x30]
+  add sp, sp, #0x40
+  msr tpidr_el0, x18
+  cbz x0, 12f
+  mov x17, x0
+  b 13f
+12:
+  ldr x17, [x18, #0x1788]
+13:
+  cbz x17, ExitFunctionSuspendResumePoint
+  // ARM64EC C++ homes args at [sp+0]. Keep CPUArea+TEB above that.
+  sub sp, sp, #0x40
+  stp x17, x18, [sp, #0x30]
+#endif
   bl "#StoreJitStateToContextAmd64"
+#ifdef FEX_ON_WINE_APPLE
+  // s34: restored x17 is the slab (or TEB fallback). Do not re-read TEB+0x1788.
+  ldp x17, x18, [sp, #0x30]
+  add sp, sp, #0x40
+  msr tpidr_el0, x18
+  cbz x17, 6f
+  strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+6:
+  ldr x15, [x17, #0x20] // SuspendDoorbell
+  cbz x15, ExitFunctionSuspendResumePoint
+  ldr w15, [x15]
+  cbnz w15, ExitFunctionSuspendPoint
+  b ExitFunctionSuspendResumePoint
+#else
   mrs x18, tpidr_el0
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
   ldr w17, [x17]
   cbnz w17, ExitFunctionSuspendPoint
+#endif
 
 .global ExitFunctionSuspendResumePoint
 ExitFunctionSuspendResumePoint:
-  mrs x18, tpidr_el0
 #ifdef FEX_ON_WINE_APPLE
-  // Frame->rip = x64 return so AfterNative/EnterEC resume the caller, not ARM64.
-  ldr x17, [x18, #0x1788]
-  ldr x15, [x17, #0x30]
-  ldp x9, x16, [sp]
-  str x16, [x15, #0x18]
-  bl "#ApplyJitStateToCpuForEcEntry"
+  // x18/tpidr already TEB from the pin above. Do not mrs Darwin tpidr.
+  lsr x15, x18, #40
+  cbnz x15, 8f
   mrs x18, tpidr_el0
+8:
+  msr tpidr_el0, x18
+  ldr x17, [x18, #0x1788]
+  cbz x17, 9f
+  ldr x15, [x17, #0x30]
+  cbz x15, 9f
+  ldp x9, x16, [sp]
+  // s40: skip-pop x16=0 must not wipe StoreJit RIP from guest [RSP].
+  // Only ARM-SP pop that looks like hostname x64 is a real resume RIP.
+  movz x14, #0
+  movk x14, #0x4000, lsl #16
+  movk x14, #0x1, lsl #32
+  sub x14, x16, x14
+  lsr x14, x14, #20
+  cbnz x14, 22f
+  str x16, [x15, #0x18]
+22:
+  sub sp, sp, #0x40
+  stp x17, x18, [sp, #0x30]
+  bl "#ApplyJitStateToCpuForEcEntry"
+  ldp x17, x18, [sp, #0x30]
+  add sp, sp, #0x40
+  msr tpidr_el0, x18
+  // s106: C++ epilogue clobbers x4/x5 after ApplyJitState. Reload 5th/6th
+  // ARM64EC args from CPUArea StateFrame gregs[RSP]. Do not use x23.
+  // Do not restore s104 x23 ldrs. Do not svc.
+  // s108: C++ return also clobbers x0 (ARM64EC RCX/Parent). Reload x0 from
+  // Frame gregs[RCX] while x14 is still StateFrame. RSP lives in x15.
+  // CPUState: gregs[] at +0x20; RCX=+0x28 RDX=+0x30 RBX=+0x38 RSP=+0x40.
+  // s109: keep s108 x0 Parent; x4/x5 from [Rsp+0x20]/[+0x28] IAT/Flags
+  // (s107 offsets + s108 x0). Not +0x20 alone. Not x23. Not svc.
+  cbz x17, 23f
+  ldr x14, [x17, #0x30]          // CPUArea EmulatorData[0] StateFrame
+  cbz x14, 23f
+  ldr x0, [x14, #0x28]           // Frame->State.gregs[REG_RCX] Parent
+  ldr x15, [x14, #0x40]          // Frame->State.gregs[REG_RSP]
+  cbz x15, 23f
+  ldr x4, [x15, #0x20]           // IAT (ARM64EC 5th arg)
+  ldr x5, [x15, #0x28]           // Flags (ARM64EC 6th arg)
+  // s123: RIP-local TEB pin only at WriteConsoleW 12b0/12b6. Not global s110.
+  // Save x0/x4/x5/x14/x18 around bl (C homes [sp+0]; C++ clobbers x18).
+  // Restore x18 unless helper returns live TEB. Do not mrs Darwin over pin.
+  sub sp, sp, #0x40
+  stp x0, x4, [sp, #0x10]
+  stp x5, x14, [sp, #0x20]
+  str x18, [sp, #0x30]
+  mov x0, x14                    // StateFrame == &Frame->State
+  bl "#FEXWineAppleTebIfWriteConsole"
+  cbz x0, 24f
+  mov x18, x0
+  msr tpidr_el0, x18
+  b 25f
+24:
+  ldr x18, [sp, #0x30]
+  msr tpidr_el0, x18
+25:
+  ldp x0, x4, [sp, #0x10]
+  ldp x5, x14, [sp, #0x20]
+  add sp, sp, #0x40
+23:
   ldp x9, x16, [sp], #16
   adrp x30, WineAppleAfterNative
   add x30, x30, :lo12:WineAppleAfterNative
   br x9
+9:
+  ldp x9, x16, [sp], #16
+  br x9
+#else
+  mrs x18, tpidr_el0
 #endif
   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).
   // It is assumed that a 'blr x16' instruction is only ever used to call into x86 code from an exit thunk, and that all

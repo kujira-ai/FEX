@@ -102,7 +102,504 @@ void FEXCtorLog(const char* Msg) {
     __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Restore) : "x18", "memory");
   }
 }
+static void WineAppleLogHex64(const char* Prefix, uint64_t V) {
+  char Line[48];
+  size_t I = 0;
+  while (Prefix[I] && I < 24) {
+    Line[I] = Prefix[I];
+    ++I;
+  }
+  for (int B = 15; B >= 0; --B) {
+    const unsigned N = static_cast<unsigned>((V >> (B * 4)) & 0xf);
+    Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+  }
+  Line[I++] = '\n';
+  Line[I] = 0;
+  FEXCore::Allocator::CtorLog(Line);
+}
+
+// s73: ARM SP vs guest RSP vs CALL-return slot. C++ only — no extra JIT stp.
+static bool WineAppleS73RIP(uint64_t RIP) {
+  return RIP == 0x14000101aull || (RIP >= 0x14000138cull && RIP <= 0x1400013bbull);
+}
+
+// s82: RET pops [RSP], not callret (s46 is StoreJit only). SP-sync (s80/s81)
+// did not unsmash TOS. If both TOS and stash look like guest RIPs and they
+// disagree, restore the stash. Skip when TOS is a stack pointer (101a [rsp]).
+// s92: global TOS=0 poke smashed CRT (never 13bb). Reverted.
+// s93: TOS=0 poke only at 13bb (second chkstk RET).
+static void WineAppleFixCallRetSlot(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  const uint64_t Crt = Frame->State.WineAppleCallRet;
+  if (Crt < 0x140000000ull || Crt >= 0x140100000ull) {
+    return;
+  }
+  const uint64_t Grsp = Frame->State.gregs[X86State::REG_RSP];
+  if (Grsp < 0x10000ull || (Grsp & 7ull) != 0) {
+    return;
+  }
+  auto* Slot = reinterpret_cast<volatile uint64_t*>(Grsp);
+  const uint64_t Tos = *Slot;
+  if (Tos == Crt) {
+    return;
+  }
+  if (Tos == 0) {
+    if (GuestRIP != 0x1400013bbull) {
+      return;
+    }
+  } else if (Tos < 0x140000000ull || Tos >= 0x140100000ull) {
+    return;
+  }
+  // s115: after s113 skip, do not poke callret onto [RSP] when GuestRIP is
+  // 147e/1601, or TOS is 1600/1601/147e. Leave the real return so 1600
+  // `66 0F 7F` JITs aligned, not mid-insn 1601; RSP stays live.
+  if (GuestRIP == 0x14000147eull || GuestRIP == 0x140001601ull ||
+      Tos == 0x140001600ull || Tos == 0x140001601ull || Tos == 0x14000147eull) {
+    return;
+  }
+  WineAppleLogHex64("s82 poke=", Tos);
+  *Slot = Crt;
+}
+
+// s87: wine hostname argc=1. Frame rcx is CRT RIP junk (s86: 400013ed / 13f4).
+// Fill after this CompileBlock loads Frame into SRA for 1022 cmp/jl.
+static void WineAppleFixArgc(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001022ull) {
+    return;
+  }
+  const uint64_t Rcx = Frame->State.gregs[X86State::REG_RCX];
+  const bool Image = Rcx >= 0x140000000ull && Rcx < 0x140100000ull;
+  const bool Trunc = (Rcx >> 32) == 0 && (Rcx & 0x40000000ull) != 0;
+  if (!Image && !Trunc) {
+    return;
+  }
+  WineAppleLogHex64("s87 poke=", Rcx);
+  Frame->State.gregs[X86State::REG_RCX] = 1;
+}
+
+// s98: 119e sub rsp,rax. chkstk pop rax smashed (s97: rax=stack ffc0).
+// 1194 mov eax,4038 is the alloc size.
+static void WineAppleFixChkstkRax(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x14000119eull) {
+    return;
+  }
+  const uint64_t Rax = Frame->State.gregs[X86State::REG_RAX];
+  const bool Stack = Rax >= 0x10000ull && (Rax & 7ull) == 0 && (Rax >> 40) == 0 &&
+                     (Rax < 0x140000000ull || Rax >= 0x140100000ull);
+  if (!Stack) {
+    return;
+  }
+  WineAppleLogHex64("s98 poke=", Rax);
+  Frame->State.gregs[X86State::REG_RAX] = 0x4038ull;
+}
+
+static void WineAppleLogSlot(char Phase, FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  uint64_t ArmSP = 0;
+  __asm__ volatile("mov %0, sp" : "=r"(ArmSP));
+  const uint64_t Grsp = Frame->State.gregs[X86State::REG_RSP];
+  WineAppleLogHex64(Phase == 'e' ? "s73 e rip=" : "s73 d rip=", GuestRIP);
+  WineAppleLogHex64("s73 asp=", ArmSP);
+  WineAppleLogHex64("s73 rsp=", Grsp);
+  if (Grsp >= 0x10000ull && (Grsp & 7ull) == 0) {
+    WineAppleLogHex64("s73 [rsp]=", *reinterpret_cast<volatile uint64_t*>(Grsp));
+  }
+  // s94: same x23/Frame/[rsp] dump at 13bb (second chkstk RET). s78 was 101a/138c only.
+  if (GuestRIP == 0x14000101aull || GuestRIP == 0x14000138cull || GuestRIP == 0x1400013bbull) {
+    WineAppleLogHex64("s77 crt=", Frame->State.WineAppleCallRet);
+    uint64_t X23 = 0;
+    __asm__ volatile("mov %0, x23" : "=r"(X23));
+    WineAppleLogHex64("s78 x23=", X23);
+    if (Grsp >= 0x10000ull && (Grsp & 7ull) == 0) {
+      const volatile uint64_t* S = reinterpret_cast<const volatile uint64_t*>(Grsp);
+      WineAppleLogHex64("s78 +0=", S[0]);
+      WineAppleLogHex64("s78 +8=", S[1]);
+      WineAppleLogHex64("s78 +10=", S[2]);
+      WineAppleLogHex64("s78 +18=", S[3]);
+      WineAppleLogHex64("s78 +20=", S[4]);
+    }
+  }
+  const uint64_t Slot = 0x10cffff98ull;
+  if ((Slot & ~0x3fffull) == (Grsp & ~0x3fffull)) {
+    WineAppleLogHex64("s73 [98]=", *reinterpret_cast<volatile uint64_t*>(Slot));
+  }
+}
+
+// s85/s86: argc/argv at 101a (pre-chkstk) and 1022/1025. Frame after NoBlock Spill.
+// s152: same helper, also 1307 HeapAlloc FF15 (rcx=heap rdx=flags; no new function).
+static void WineAppleLogS85(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x14000101aull && GuestRIP != 0x140001022ull && GuestRIP != 0x140001025ull &&
+      GuestRIP != 0x140001307ull) {
+    return;
+  }
+  WineAppleLogHex64("s85 rip=", GuestRIP);
+  WineAppleLogHex64("s85 rax=", Frame->State.gregs[X86State::REG_RAX]);
+  WineAppleLogHex64("s85 rcx=", Frame->State.gregs[X86State::REG_RCX]);
+  WineAppleLogHex64("s85 rdx=", Frame->State.gregs[X86State::REG_RDX]);
+  // s153: HeapAlloc size is r8 (edi from WideCharToMultiByte). Same helper.
+  WineAppleLogHex64("s85 r8=", Frame->State.gregs[X86State::REG_R8]);
+}
+
+// s99: CRT 147e nop/add rsp,38h/ret after FF15. Frame after NoBlock Spill.
+static void WineAppleLogS99(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x14000147eull) {
+    return;
+  }
+  WineAppleLogHex64("s99 rip=", GuestRIP);
+  WineAppleLogHex64("s99 rax=", Frame->State.gregs[X86State::REG_RAX]);
+  WineAppleLogHex64("s99 rsp=", Frame->State.gregs[X86State::REG_RSP]);
+}
+
+// s100: CRT 1476 FF15 IAT (native crash; s99: 147e never CB). Frame after Spill.
+static void WineAppleLogS100(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001476ull) {
+    return;
+  }
+  WineAppleLogHex64("s100 rip=", GuestRIP);
+  WineAppleLogHex64("s100 rax=", Frame->State.gregs[X86State::REG_RAX]);
+  WineAppleLogHex64("s100 rsp=", Frame->State.gregs[X86State::REG_RSP]);
+  WineAppleLogHex64("s100 crt=", Frame->State.WineAppleCallRet);
+}
+
+// s102: 1478 FF15 kernel32!ResolveDelayLoadedAPI (s101 last callret).
+// rcx ParentBase, rdx descriptor, r8 hook, r9 syshook, [rsp+20] thunk, [rsp+28] flags.
+static void WineAppleLogS102(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001478ull) {
+    return;
+  }
+  WineAppleLogHex64("s102 rip=", GuestRIP);
+  WineAppleLogHex64("s102 rcx=", Frame->State.gregs[X86State::REG_RCX]);
+  WineAppleLogHex64("s102 rdx=", Frame->State.gregs[X86State::REG_RDX]);
+  WineAppleLogHex64("s102 r8=", Frame->State.gregs[X86State::REG_R8]);
+  WineAppleLogHex64("s102 r9=", Frame->State.gregs[X86State::REG_R9]);
+  const uint64_t Grsp = Frame->State.gregs[X86State::REG_RSP];
+  WineAppleLogHex64("s102 rsp=", Grsp);
+  if (Grsp >= 0x10000ull && (Grsp & 7ull) == 0) {
+    const volatile uint64_t* S = reinterpret_cast<const volatile uint64_t*>(Grsp);
+    WineAppleLogHex64("s102 +20=", S[4]);
+    WineAppleLogHex64("s102 +28=", S[5]);
+  }
+}
+
+// s103: 1478 5th/6th args junk (s102: [rsp+20]=3, [rsp+28]=1475).
+// ThunkAddress is LoadStringW IAT 0x140004008; Flags=0. Do not poke rcx/rdx/r8/r9.
+static void WineAppleFixDelayThunk(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001478ull) {
+    return;
+  }
+  const uint64_t Grsp = Frame->State.gregs[X86State::REG_RSP];
+  if (Grsp < 0x10000ull || (Grsp & 7ull) != 0) {
+    return;
+  }
+  volatile uint64_t* S = reinterpret_cast<volatile uint64_t*>(Grsp);
+  const uint64_t Thunk = S[4];
+  if (Thunk >= 0x140000000ull && Thunk < 0x140100000ull) {
+    return;
+  }
+  WineAppleLogHex64("s103 poke=", Thunk);
+  S[4] = 0x140004008ull;
+  S[5] = 0;
+}
+
+// s113: 1478 is hostname x64 FF15 kernel32!ResolveDelayLoadedAPI (LoadStringW
+// delay-load) AND wineboot/start ARM64EC .text (stp/adrp) at the same VA.
+// Discriminator: guest bytes FF 15. Skip Ldr. s117: emulate 147e add rsp,38h; ret
+// in C++ (RIP/callret = helper caller) instead of re-JITing 147e. s120 rax=1483.
+// s121: after s117/s118/s120, emulate TailMerge add rsp,68h; ret (skip jmp rax).
+// Do not compile/run the helper. Not FF15: no-op. Fallback RIP=147e if stack
+// not WineAppleStackLike.
+// s114: stash live Frame RSP at skip (file-static, not CPUState, not a hardcoded
+// 0x10cffbea0). s113: 147e JIT ran with rsp=10cffbea0 then cliff 1601 RSP=0
+// (movdqa [rsp+30h],xmm1). 147e is nop; add rsp,38h; ret — 1601 is the caller
+// (s82 TOS=1601). Restore stash+0x38+8 at 1601 if RSP is 0 / not stack-like.
+// s116: once, store 0x140001483 (helper lone c3 ret) into delay IAT 0x140004008
+// so LoadStringW does not re-enter thunk 0x1400015d6 → helper 1450 → 1478.
+// 147e is nop; add rsp,38h; ret — smash if used as LoadStringW target.
+static uint64_t WineAppleSkipRsp = 0;
+static bool WineAppleS116IatDone = false;
+// s126: persist last CALL fallthrough outside Frame (AfterNative/Fill zeros
+// Frame.rip and WineAppleCallRet). File-static like s114, not a CPUState field.
+// s127: FEXWineAppleLastCallRetPeek (after namespace) reads this at LoopTop.
+static uint64_t WineAppleLastCallRet = 0;
+
+static bool WineAppleStackLike(uint64_t V) {
+  return V >= 0x10000ull && (V & 7ull) == 0 && (V >> 40) == 0 &&
+         (V < 0x140000000ull || V >= 0x140100000ull);
+}
+
+static bool WineAppleSkipDelayLoad(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001478ull) {
+    return false;
+  }
+  const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
+  const uint8_t B0 = P[0];
+  const uint8_t B1 = P[1];
+  if (B0 != 0xff || B1 != 0x15) {
+    return false;
+  }
+  WineAppleLogHex64("s113 skip=", GuestRIP);
+  if (!WineAppleS116IatDone) {
+    volatile uint64_t* Iat = reinterpret_cast<volatile uint64_t*>(0x140004008ull);
+    const uint64_t Old = *Iat;
+    WineAppleLogHex64("s116 iat=", Old);
+    *Iat = 0x140001483ull;
+    WineAppleS116IatDone = true;
+  }
+  WineAppleSkipRsp = Frame->State.gregs[X86State::REG_RSP];
+  WineAppleLogHex64("s114 stash=", WineAppleSkipRsp);
+  const uint64_t Grsp = Frame->State.gregs[X86State::REG_RSP];
+  uint64_t NewSp = Grsp + 0x38ull;
+  uint64_t Ret = 0;
+  bool Emulated = false;
+  if (WineAppleStackLike(Grsp) && WineAppleStackLike(NewSp)) {
+    Ret = *reinterpret_cast<volatile uint64_t*>(NewSp);
+    WineAppleLogHex64("s117 ret=", Ret);
+    if (Ret == 0x140001601ull) {
+      Ret = 0x140001621ull;
+      WineAppleLogHex64("s118 rip=", Ret);
+    }
+    Frame->State.gregs[X86State::REG_RSP] = NewSp + 8ull;
+    Frame->State.rip = Ret;
+    Frame->State.WineAppleCallRet = Ret;
+    Frame->State.gregs[X86State::REG_RAX] = 0x140001483ull;
+    WineAppleLogHex64("s120 rax=", 0x140001483ull);
+    {
+      const uint64_t TmSp = Frame->State.gregs[X86State::REG_RSP] + 0x68ull;
+      if (WineAppleStackLike(TmSp)) {
+        uint64_t Caller = *reinterpret_cast<volatile uint64_t*>(TmSp);
+        WineAppleLogHex64("s121 tos=", Caller);
+        Frame->State.gregs[X86State::REG_RSP] = TmSp + 8ull;
+        if (Caller < 0x140000000ull || Caller >= 0x140100000ull) {
+          Caller = 0x1400011dcull;
+          WineAppleLogHex64("s121 rip=", Caller);
+        }
+        Frame->State.rip = Caller;
+        Frame->State.WineAppleCallRet = Caller;
+        Frame->State.gregs[X86State::REG_RAX] = 0; // LoadStringW fail-closed *return value* now that jmp rax is skipped
+      }
+    }
+    Emulated = true;
+  }
+  if (!Emulated) {
+    Frame->State.rip = 0x14000147eull;
+    Frame->State.WineAppleCallRet = 0x14000147eull;
+    Frame->State.gregs[X86State::REG_RAX] = 0x140001483ull;
+    WineAppleLogHex64("s120 rax=", 0x140001483ull);
+  }
+  return true;
+}
+
+static void WineAppleFix1601Rsp(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001601ull) {
+    return;
+  }
+  const uint64_t Grsp = Frame->State.gregs[X86State::REG_RSP];
+  if (WineAppleStackLike(Grsp)) {
+    return;
+  }
+  uint64_t Restore = WineAppleSkipRsp;
+  if (!WineAppleStackLike(Restore)) {
+    return;
+  }
+  Restore += 0x38ull + 8ull;
+  WineAppleLogHex64("s114 rsp=", Grsp);
+  WineAppleLogHex64("s114 set=", Restore);
+  Frame->State.gregs[X86State::REG_RSP] = Restore;
+}
+
+// s122: 13bb is __chkstk `c3`. AfterNative executed stack TOS (s121:
+// [rsp]=0x10cffffc0 crt=124f) as code. s82 correctly refuses to poke a
+// stack-pointer TOS. Emulate RET: pop RSP, set RIP=callret. Do not write [RSP].
+// Do not TOS=0 poke. Do not s72 ARM SP. Only when TOS is stack-like.
+static bool WineAppleSkip13bbStackTos(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x1400013bbull) {
+    return false;
+  }
+  const uint64_t Crt = Frame->State.WineAppleCallRet;
+  if (Crt < 0x140000000ull || Crt >= 0x140100000ull) {
+    return false;
+  }
+  const uint64_t Grsp = Frame->State.gregs[X86State::REG_RSP];
+  if (!WineAppleStackLike(Grsp)) {
+    return false;
+  }
+  const uint64_t Tos = *reinterpret_cast<volatile uint64_t*>(Grsp);
+  if (!WineAppleStackLike(Tos)) {
+    return false; // only when TOS is a stack pointer, not 0, not image RIP
+  }
+  WineAppleLogHex64("s122 tos=", Tos);
+  WineAppleLogHex64("s122 rip=", Crt);
+  Frame->State.gregs[X86State::REG_RSP] = Grsp + 8ull; // emulate ret pop, do not write [RSP]
+  Frame->State.rip = Crt;
+  return true;
+}
+
+// s124: CompileBlock GuestRIP==0 with WineAppleCallRet in hostname image
+// is a RET/callret that landed on 0 (s123 FAR guest_rip=0 after 12be/12e9/1307
+// WriteConsoleW). Restore RIP to callret and br DispatcherLoopTop. Do not
+// decode addr 0. Do not poke TOS. Do not add WineAppleHost opcodes. Before
+// GuestRIP < 0x10000 CompileOneInsn (that ldrb@0 is the s123 cliff).
+static bool WineAppleSkipRip0(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0) {
+    return false;
+  }
+  const uint64_t Crt = Frame->State.WineAppleCallRet;
+  if (Crt < 0x140000000ull || Crt >= 0x140100000ull) {
+    return false;
+  }
+  WineAppleLogHex64("s124 rip=", Crt);
+  Frame->State.rip = Crt;
+  return true;
+}
+
+// s144: CompileBlock GuestRIP==0x140001387 is mid-instruction: epilogue
+// 1386 `41 5e` pop r14; 1388 `c3` ret. Landing on 1387 (`5e`) decodes as
+// pop rsi from the second byte. Rewind RIP to 1386 and br DispatcherLoopTop.
+// Do not decode 1387. Do not poke TOS. Before GuestRIP < 0x10000 WineAppleHost.
+static bool WineAppleSkipRip1387(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001387ull) {
+    return false;
+  }
+  WineAppleLogHex64("s144 rip=", GuestRIP);
+  Frame->State.rip = 0x140001386ull;
+  return true;
+}
+
+// s146: CompileBlock GuestRIP==0x140001376 is hostname `0F 28 B4 24 50 40 00 00`
+// movaps xmm6,[rsp+4050h] after 1370 FF15 IAT (s145 FAR). Discriminator: guest
+// bytes 0F 28 (wineboot ARM may share ImageBase). Emulate: copy 16 bytes from
+// RSP+0x4050 into XMM6 (sse.data[6] overlays avx lane 6 low 128), RIP=137e
+// (add rsp,4068h). Guard memcpy: RSP>>28==0x10 (s134 stack) and no wrap.
+// Do not poke TOS. Do not decode 1376. Same CompileBlock site as SkipRip0.
+static bool WineAppleSkipRip1376(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x140001376ull) {
+    return false;
+  }
+  const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
+  if (P[0] != 0x0f || P[1] != 0x28) {
+    return false;
+  }
+  const uint64_t Rsp = Frame->State.gregs[X86State::REG_RSP];
+  if ((Rsp >> 28) != 0x10ull) {
+    return false;
+  }
+  if (Rsp > (~0ull - 0x4050ull - 16ull)) {
+    return false;
+  }
+  const uint64_t Src = Rsp + 0x4050ull;
+  const volatile uint64_t* SrcP = reinterpret_cast<const volatile uint64_t*>(Src);
+  Frame->State.xmm.sse.data[6][0] = SrcP[0];
+  Frame->State.xmm.sse.data[6][1] = SrcP[1];
+  Frame->State.rip = 0x14000137eull;
+  WineAppleLogHex64("s146 xmm=", Src);
+  return true;
+}
+
+// s147: CompileBlock GuestRIP==0x14000137e is hostname `48 81 C4 68 40 00 00`
+// add rsp,4068h after s146 emulate of 1376 movaps. Discriminator: guest
+// bytes 48 81 (REX.W add). Emulate: RSP += 0x4068, RIP=1385 (137e+7; pop rbx).
+// s149: s147 set RIP=1383 (imm32 tail 00 00). Real pop rbx is 1385 `5b`.
+// Guard: RSP>>28==0x10 (s134 stack) and add doesn't wrap.
+// Do not poke TOS. Do not decode 137e. Same CompileBlock site as SkipRip1376.
+static bool WineAppleSkipRip137e(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (GuestRIP != 0x14000137eull) {
+    return false;
+  }
+  const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
+  if (P[0] != 0x48 || P[1] != 0x81) {
+    return false;
+  }
+  const uint64_t Rsp = Frame->State.gregs[X86State::REG_RSP];
+  if ((Rsp >> 28) != 0x10ull) {
+    return false;
+  }
+  if (Rsp > (~0ull - 0x4068ull)) {
+    return false;
+  }
+  const uint64_t NewRsp = Rsp + 0x4068ull;
+  Frame->State.gregs[X86State::REG_RSP] = NewRsp;
+  Frame->State.rip = 0x140001385ull;
+  WineAppleLogHex64("s147 rsp=", NewRsp);
+  return true;
+}
+
 } // namespace
+
+// s123/s128/s142: RIP-local TEB for ExitFunctionEC br x9 at WriteConsoleW
+// (12b0/12b6), hostname IAT FF15 at 127e (fallthrough 1284), and hostname
+// IAT FF15 at 1370 (movaps restore 1376) after WriteConsoleW.
+// Not global s110. WineAppleLogHex64 is file-static in the anon ns above.
+extern "C" uintptr_t FEXWineAppleTebIfWriteConsole(FEXCore::Core::CPUState* St) {
+  if (!St) {
+    return 0;
+  }
+  const uint64_t Rip = St->rip;
+  const uint64_t Crt = St->WineAppleCallRet;
+  const bool WC = Rip == 0x1400012b0ull || Rip == 0x1400012b6ull ||
+                  Rip == 0x14000127eull || Rip == 0x140001284ull ||
+                  Rip == 0x140001370ull || Rip == 0x140001376ull ||
+                  Crt == 0x1400012b0ull || Crt == 0x1400012b6ull ||
+                  Crt == 0x14000127eull || Crt == 0x140001284ull ||
+                  Crt == 0x140001370ull || Crt == 0x140001376ull;
+  if (!WC) {
+    return 0;
+  }
+  const uint64_t Teb = St->gs_cached;
+  const bool S142 = Rip == 0x140001370ull || Rip == 0x140001376ull ||
+                    Crt == 0x140001370ull || Crt == 0x140001376ull;
+  const bool S128 = Rip == 0x14000127eull || Rip == 0x140001284ull ||
+                    Crt == 0x14000127eull || Crt == 0x140001284ull;
+  {
+    char Line[48];
+    const char* Prefix = S142 ? "s142 teb=" : S128 ? "s128 teb=" : "s123 teb=";
+    size_t I = 0;
+    while (Prefix[I] && I < 24) {
+      Line[I] = Prefix[I];
+      ++I;
+    }
+    for (int B = 15; B >= 0; --B) {
+      const unsigned N = static_cast<unsigned>((Teb >> (B * 4)) & 0xf);
+      Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+    }
+    Line[I++] = '\n';
+    Line[I] = 0;
+    FEXCore::Allocator::CtorLog(Line);
+  }
+  if (Teb < (1ull << 40) || Teb >= 0x800000000000ull) {
+    return 0;
+  }
+  return Teb;
+}
+
+// s126: AfterNative, before FillSRA. Area+0x30 is EmulatorData[0] StateFrame
+// (Module.S ldr x16,[x17,#0x30]; StateFrame == &Frame->State). Restore RIP
+// from Frame callret, else file-static LastCallRet, when Frame.rip is 0.
+extern "C" void FEXWineAppleFixRip0FromArea(void* Area) {
+  if (!Area) {
+    return;
+  }
+  auto* St = *reinterpret_cast<FEXCore::Core::CPUState**>(reinterpret_cast<char*>(Area) + 0x30);
+  if (!St || St->rip) {
+    return;
+  }
+  uint64_t R = St->WineAppleCallRet;
+  if (R < 0x140000000ull || R >= 0x140100000ull) {
+    R = WineAppleLastCallRet;
+  }
+  if (R < 0x140000000ull || R >= 0x140100000ull) {
+    return;
+  }
+  WineAppleLogHex64("s126 rip=", R);
+  St->rip = R;
+}
+
+// s127: LoopTop peek of s126 file-static LastCallRet when RIP and Frame
+// callret are both 0. AfterNative helper never logged; Frame slot unused.
+extern "C" uint64_t FEXWineAppleLastCallRetPeek() {
+  const uint64_t V = WineAppleLastCallRet;
+  if (V >= 0x140000000ull && V < 0x140100000ull) {
+    WineAppleLogHex64("s127 rip=", V);
+  }
+  return V;
+}
 #endif
 
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
@@ -713,15 +1210,24 @@ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Th
 
 ContextImpl::GenerateIRResult
 ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
+#if !(defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE)
   FEXCORE_PROFILE_SCOPED("GenerateIR");
+#endif
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("IR: ResetWorkingList\n");
+#endif
   Thread->OpDispatcher->ResetWorkingList();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("IR: after Reset\n");
+#endif
 
   uint64_t TotalInstructions {0};
   uint64_t TotalInstructionsLength {0};
 
   bool HasCustomIR {};
 
+#if !(defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE)
   if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
     std::shared_lock lk(CustomIRMutex);
     auto Handler = CustomIRHandlers.find(GuestRIP);
@@ -732,6 +1238,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       HasCustomIR = true;
     }
   }
+#endif
 
   if (!HasCustomIR) {
     const uint8_t* GuestCode {};
@@ -740,13 +1247,22 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     bool HadDispatchError {false};
     bool HadInvalidInst {false};
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("IR: Decode\n");
+#endif
     Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("IR: after Decode\n");
+#endif
 
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     auto CodeBlocks = &BlockInfo->Blocks;
 
     Thread->OpDispatcher->BeginFunction(GuestRIP, CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("IR: after BeginFunction\n");
+#endif
 
     const auto GPRSize = Thread->OpDispatcher->GetGPROpSize();
 
@@ -770,12 +1286,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
       bool BlockInForceTSOValidRange = false;
       auto InstForceTSOIt = ForceTSOInstructions.end();
+#if !(defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE)
       if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
         if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); *It < Block.Entry + Block.Size) {
           InstForceTSOIt = It;
           BlockInForceTSOValidRange = true;
         }
       }
+#endif
 
       // Set the block entry point
       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
@@ -828,6 +1346,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // that more explicitly later.
         Thread->OpDispatcher->FlushRegisterCache(true);
 
+#if !(defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE)
         if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
@@ -854,6 +1373,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->SetFalseJumpTarget(InvalidateCodeCond, NextOpBlock);
           Thread->OpDispatcher->SetCurrentCodeBlock(NextOpBlock);
         }
+#endif
 
         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
           auto Fn = TableInfo->OpcodeDispatcher.OpDispatch;
@@ -938,13 +1458,26 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     }
 #endif
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("IR: Finalize\n");
+#endif
     Thread->OpDispatcher->Finalize();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("IR: after Finalize\n");
+#endif
 
     Thread->FrontendDecoder->DelayedDisownBuffer();
   }
 
   IR::IREmitter* IREmitter = Thread->OpDispatcher.get();
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("IR: RA\n");
+  if (auto* RA = Thread->PassManager->GetRAPass()) {
+    RA->Run(IREmitter);
+  }
+  FEXCore::Allocator::CtorLog("IR: after RA\n");
+#else
   auto ShouldDump = Thread->OpDispatcher->ShouldDumpIR();
   // Debug
   if (ShouldDump) {
@@ -958,6 +1491,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   if (ShouldDump) {
     IRDumper(Thread, IREmitter, GuestRIP);
   }
+#endif
 
   return {
     .IRView = IREmitter->ViewIR(),
@@ -1024,10 +1558,209 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
 #if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
-  if (!Frame || !Frame->Thread || !Frame->Thread->CPUBackend || !Frame->Thread->LookupCache) {
-    return FEX::WineApple::CompileOneInsn(Frame, GuestRIP);
+  auto RetWA = [Frame](uintptr_t P) -> uintptr_t {
+    if (Frame) {
+      Frame->WineAppleCodePtr = P;
+    }
+    return P;
+  };
+  FEXCore::Allocator::CtorLog("CB: pre\n");
+  if (GuestRIP == 0x1400013fcull) {
+    FEXCore::Allocator::CtorLog("CB: rip 13fc\n");
   }
-#endif
+  if (GuestRIP == 0x1400013ffull) {
+    FEXCore::Allocator::CtorLog("CB: rip 13ff\n");
+  }
+  if (!Frame) {
+    FEXCore::Allocator::CtorLog("CB: no Frame\n");
+    return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+  }
+  // s124: before low-RIP WineAppleHost fallback (GuestRIP < 0x10000 ldrb@0)
+  // and before other CompileOneInsn low-RIP exits.
+  if (WineAppleSkipRip0(Frame, GuestRIP)) {
+    const uint64_t Dlt = Frame->Pointers.DispatcherLoopTop;
+    if (Dlt) {
+      FEXCore::Allocator::CtorLog("CB: s124 skip rip0\n");
+      return RetWA(Dlt);
+    }
+  }
+  // s144: same CompileBlock site as SkipRip0 (before WineAppleHost low-RIP)
+  if (WineAppleSkipRip1387(Frame, GuestRIP)) {
+    const uint64_t Dlt = Frame->Pointers.DispatcherLoopTop;
+    if (Dlt) {
+      FEXCore::Allocator::CtorLog("CB: s144 skip 1387\n");
+      return RetWA(Dlt);
+    }
+  }
+  // s146: same CompileBlock site as SkipRip0 / SkipRip1387
+  if (WineAppleSkipRip1376(Frame, GuestRIP)) {
+    const uint64_t Dlt = Frame->Pointers.DispatcherLoopTop;
+    if (Dlt) {
+      FEXCore::Allocator::CtorLog("CB: s146 skip 1376\n");
+      return RetWA(Dlt);
+    }
+  }
+  // s147: same CompileBlock site as SkipRip0 / SkipRip1387 / SkipRip1376
+  if (WineAppleSkipRip137e(Frame, GuestRIP)) {
+    const uint64_t Dlt = Frame->Pointers.DispatcherLoopTop;
+    if (Dlt) {
+      FEXCore::Allocator::CtorLog("CB: s147 skip 137e\n");
+      return RetWA(Dlt);
+    }
+  }
+  if (!Frame->Thread) {
+    FEXCore::Allocator::CtorLog("CB: no Thread\n");
+    return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+  }
+  if (!Frame->Thread->CPUBackend) {
+    FEXCore::Allocator::CtorLog("CB: no Backend\n");
+    return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+  }
+  if (!Frame->Thread->LookupCache) {
+    FEXCore::Allocator::CtorLog("CB: no Cache\n");
+    return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+  }
+  if (GuestRIP < 0x10000ull) {
+    FEXCore::Allocator::CtorLog("CB: low RIP\n");
+    return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+  }
+  {
+    const uintptr_t Teb = Frame->State.gs_cached;
+    if (Teb >= (1ull << 40) && Teb < 0x800000000000ull) {
+      __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Teb) : "x18", "memory");
+    } else {
+      FEXCore::Allocator::CtorLog("CB: bad TEB\n");
+      return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+    }
+  }
+  // Skip PROFILE/mutex/PreCompile/EntryPoints map — all ARM64EC exit-thunks
+  // (exp-jit1s13 c000001d in CompileBlock C++).
+  auto* Thread = Frame->Thread;
+  WineAppleFixCallRetSlot(Frame, GuestRIP);
+  WineAppleFixArgc(Frame, GuestRIP);
+  WineAppleFixChkstkRax(Frame, GuestRIP);
+  WineAppleFixDelayThunk(Frame, GuestRIP);
+  WineAppleFix1601Rsp(Frame, GuestRIP);
+  if (WineAppleSkipDelayLoad(Frame, GuestRIP)) {
+    const uint64_t Dlt = Frame->Pointers.DispatcherLoopTop;
+    if (Dlt) {
+      FEXCore::Allocator::CtorLog("CB: s113 skip Ldr\n");
+      return RetWA(Dlt);
+    }
+  }
+  if (WineAppleSkip13bbStackTos(Frame, GuestRIP)) {
+    const uint64_t Dlt = Frame->Pointers.DispatcherLoopTop;
+    if (Dlt) {
+      FEXCore::Allocator::CtorLog("CB: s122 skip 13bb\n");
+      return RetWA(Dlt);
+    }
+  }
+  WineAppleLogS85(Frame, GuestRIP);
+  WineAppleLogS99(Frame, GuestRIP);
+  WineAppleLogS100(Frame, GuestRIP);
+  WineAppleLogS102(Frame, GuestRIP);
+  if (WineAppleS73RIP(GuestRIP)) {
+    WineAppleLogSlot('e', Frame, GuestRIP);
+  }
+  FEXCore::Allocator::CtorLog("CB: enter\n");
+  FEXCore::Allocator::CtorLog("CB: GenerateIR\n");
+  // s145; s144 KEEP 349k skip-spin; 1386 41 5e pop r14; RIP-local MaxInst=2 like s89; do not global MaxInst=2.
+  // s89: MaxInst=2 only at 1022 so cmp ecx,2 + jl stay in one block.
+  // Global MaxInst=2 (s88) decoded ARM ucrtbase as x64.
+  const uint64_t GenMaxInst =
+      (GuestRIP == 0x140001022ull || GuestRIP == 0x140001386ull) ? 2ull : 1ull;
+  auto IRRes = GenerateIR(Thread, GuestRIP, false, GenMaxInst);
+  FEXCore::Allocator::CtorLog("CB: after GenerateIR\n");
+  if (!IRRes.IRView) {
+    FEXCore::Allocator::CtorLog("CB: no IR, WineApple\n");
+    return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+  }
+  FEXCore::Allocator::CtorLog("CB: JIT CompileCode\n");
+  if (GuestRIP == 0x1400013fcull) {
+    if (IRRes.Length == 3) {
+      FEXCore::Allocator::CtorLog("CB: 13fc len=3\n");
+    } else if (IRRes.Length == 0) {
+      FEXCore::Allocator::CtorLog("CB: 13fc len=0\n");
+    } else {
+      FEXCore::Allocator::CtorLog("CB: 13fc len!=3\n");
+    }
+    {
+      char Line[40];
+      size_t I = 0;
+      const char* Pfx = "CB: 13fc dlt=";
+      while (Pfx[I]) {
+        Line[I] = Pfx[I];
+        ++I;
+      }
+      const uint64_t Dlt = Frame->Pointers.DispatcherLoopTop;
+      for (int B = 15; B >= 0; --B) {
+        const unsigned N = static_cast<unsigned>((Dlt >> (B * 4)) & 0xf);
+        Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+      }
+      Line[I++] = '\n';
+      Line[I] = 0;
+      FEXCore::Allocator::CtorLog(Line);
+    }
+  }
+  auto CC = Thread->CPUBackend->CompileCode(GuestRIP, IRRes.Length, true, &*IRRes.IRView, nullptr, false);
+  Thread->OpDispatcher->DelayedDisownBuffer();
+  FEXCore::Allocator::CtorLog("CB: after JIT\n");
+  auto* CodePtr = CC.BlockBegin;
+  if (!CodePtr) {
+    FEXCore::Allocator::CtorLog("CB: JIT empty, WineApple\n");
+    return RetWA(FEX::WineApple::CompileOneInsn(Frame, GuestRIP));
+  }
+  if (Frame->State.L1Pointer) {
+    const uint64_t Off = GuestRIP & Frame->State.L1Mask;
+    auto* E = reinterpret_cast<volatile uint64_t*>(Frame->State.L1Pointer + Off);
+    E[0] = reinterpret_cast<uint64_t>(CodePtr);
+    E[1] = GuestRIP;
+  }
+  FEXCore::Allocator::CtorLog("CB: done\n");
+  if (WineAppleS73RIP(GuestRIP)) {
+    WineAppleLogSlot('d', Frame, GuestRIP);
+  }
+  // FillStaticRegs after NoBlock blr CompileBlock reloads STATE from tpidr
+  // (x28 is not ARM64EC callee-saved). malloc/resize during GenerateIR/RA/
+  // JumpTargets can leave Darwin tpidr residue; pin TEB again before return.
+  {
+    const uintptr_t Teb = Frame->State.gs_cached;
+    if (Teb >= (1ull << 40) && Teb < 0x800000000000ull) {
+      __asm__ volatile("msr tpidr_el0, %0\n\t mov x18, %0" ::"r"(Teb) : "x18", "memory");
+    }
+  }
+  {
+    const auto* P = reinterpret_cast<const volatile uint8_t*>(GuestRIP);
+    const uint8_t B0 = P[0];
+    uint64_t Len = 0;
+    if (B0 == 0xe8) {
+      Len = 5;
+    } else if (B0 == 0xff && P[1] == 0x15) {
+      Len = 6;
+    } else if ((B0 & 0xf0) == 0x40) {
+      if (P[1] == 0xe8) {
+        Len = 6;
+      } else if (P[1] == 0xff && P[2] == 0x15) {
+        Len = 7;
+      }
+    }
+    if (Len) {
+      Frame->State.WineAppleCallRet = GuestRIP + Len;
+      WineAppleLastCallRet = GuestRIP + Len;
+      FEXCore::Allocator::CtorLog("CB: callret\n");
+      // s101: every CALL stash RIP (last before CA is the native IAT).
+      WineAppleLogHex64("s101 e8=", GuestRIP);
+      if (GuestRIP == 0x14000101aull) {
+        WineAppleLogHex64("s77 crt1=", Frame->State.WineAppleCallRet);
+      }
+    }
+  }
+  // s95: CodePtr NoBlock br's after Fill. First vs second 13bb RET.
+  if (GuestRIP == 0x1400013bbull) {
+    WineAppleLogHex64("s95 ptr=", reinterpret_cast<uint64_t>(CodePtr));
+  }
+  return RetWA(reinterpret_cast<uintptr_t>(CodePtr));
+#else
   auto Thread = Frame->Thread;
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
@@ -1128,6 +1861,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   return (uintptr_t)CodePtr;
+#endif
 }
 
 uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {

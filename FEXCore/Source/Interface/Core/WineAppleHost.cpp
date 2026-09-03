@@ -178,6 +178,7 @@ void Ensure() {
 }
 
 uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  FEXCore::Allocator::CtorLog("WA: enter\n");
   const uint64_t LoopTop = Frame ? Frame->Pointers.DispatcherLoopTop : 0;
   if (GuestRIP < 0x10000ull) {
     void* U = UnhandledFAR0();
@@ -277,6 +278,9 @@ uintptr_t CompileOneInsn(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP)
     const int32_t Disp = static_cast<int32_t>(static_cast<uint32_t>(B1) | (static_cast<uint32_t>(B2) << 8) |
                                               (static_cast<uint32_t>(B3) << 16) | (static_cast<uint32_t>(B4) << 24));
     const uint64_t Ret = GuestRIP + 5;
+    if (Frame) {
+      Frame->State.WineAppleCallRet = Ret;
+    }
     const uint64_t Tgt = Ret + static_cast<uint64_t>(static_cast<int64_t>(Disp));
     Words[N++] = EncSubImm(23, 8);       // RSP -= 8
     EmitMovAbs(Words, N, 10, Ret);       // x10 = return RIP

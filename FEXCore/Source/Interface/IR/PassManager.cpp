@@ -82,7 +82,7 @@ void PassManager::AddDefaultValidationPasses() {
 }
 
 void PassManager::InsertRegisterAllocationPass(FEXCore::Context::ContextImpl* ctx) {
-  InsertPass(IR::CreateRegisterAllocationPass(&ctx->CPUID), "RA");
+  RAPassStored = InsertPass(IR::CreateRegisterAllocationPass(&ctx->CPUID), "RA");
 }
 
 void PassManager::Run(IREmitter* IREmit) {

@@ -111,11 +111,20 @@ public:
    * @return iterator to the internal tracking container
    */
   ContainerType::iterator ClaimBuffer(size_t Size, BufferOwnedFlag* CurrentClientFlag) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    // std::mutex + chrono::now are ARM64EC exit-thunks before the JIT exists.
+    auto Data = Alloc(Size);
+    auto* MB = new MemoryBuffer {Data, Size, {}};
+    MB->CurrentClientOwnedFlag = CurrentClientFlag;
+    CurrentClientFlag->store(ClientFlags::FLAG_OWNED);
+    return ClaimedBuffers.emplace(ClaimedBuffers.end(), MB);
+#else
     std::unique_lock lk {AllocationMutex};
     auto Buffer = ClaimBufferImpl(Size);
     (*Buffer)->CurrentClientOwnedFlag = CurrentClientFlag;
     CurrentClientFlag->store(ClientFlags::FLAG_OWNED);
     return Buffer;
+#endif
   }
 
   /**
@@ -143,8 +152,12 @@ public:
   void DisownBuffer(ContainerType::iterator Buffer) {
     // Client still owns the buffer but isn't using it
     // Allows us to claim it back if necessary
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    (*Buffer)->CurrentClientOwnedFlag->store(ClientFlags::FLAG_DISOWNED);
+#else
     (*Buffer)->LastUsed.store(ClockType::now(), std::memory_order_relaxed);
     (*Buffer)->CurrentClientOwnedFlag->store(ClientFlags::FLAG_DISOWNED);
+#endif
   }
 
   /**
@@ -550,6 +563,10 @@ public:
    * If the frequency of use is below the threshold then immediately `UnclaimBuffer` so that `Allocator` can reuse it.
    */
   void DelayedDisownBuffer() {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    // chrono::now → QueryPerformanceCounter IAT (x64 exit-thunk). Keep buffer owned.
+    return;
+#else
     LOGMAN_THROW_A_FMT(FEXCore::Utils::IntrusivePooledAllocator::IsClientBufferOwned(ClientOwnedFlag), "Tried to disown buffer when client "
                                                                                                        "doesn't own it");
 
@@ -567,6 +584,7 @@ public:
       Previous = Now;
     }
     ++CountPer;
+#endif
   }
 
   /**

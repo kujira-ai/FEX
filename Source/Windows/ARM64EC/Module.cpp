@@ -15,6 +15,7 @@ $end_info$
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Threads.h>
 #include <FEXCore/Utils/Profiler.h>
@@ -104,16 +105,15 @@ using WineGetCurrentTeb_t = void* (*)();
 static WineGetCurrentTeb_t FEXWineGetCurrentTeb {};
 
 static bool FEXIsPlausibleWineTeb(uintptr_t Teb) {
-  // Reject Darwin SVC residue (e.g. MAP flags 0x1002) and null/low junk.
-  if (Teb < 0x100000000ULL) {
+  // Match Dispatcher: lsr #40. Darwin pthread/stack (~0x16f…/0x1xxxx) is
+  // below 1TB; Wine TEB is ~0x7fffffd0000. Rejecting the mid window stops
+  // [tpidr,#0x1788] from treating a Darwin TLS as CPUArea (strb to 0).
+  if (Teb < (1ull << 40)) {
     return false;
   }
-  // Wine-on-macOS TEBs observed ~0x7fffffd0000 (below the old 0x7fffff000000 floor).
-  // Accept normal 64-bit user VAs; exclude kernel canonical high half.
   if (Teb >= 0x800000000000ULL) {
     return false;
   }
-  // Prefer page-aligned (TEB is on a page); still allow if slightly off.
   return true;
 }
 
@@ -423,6 +423,12 @@ extern "C" void* FEXGetX64ReturnInstr() {
   return FEXCore::Allocator::GetOrCreateX64ReturnInstr();
 }
 
+// s34: Module.S ExitFunctionEC / AfterNative — CPUArea from ThreadInit host slab.
+extern "C" void* FEXGetWineAppleCpuArea() {
+  FEXCore::Allocator::CtorLog("CA: enter\n");
+  return FEXCore::Allocator::GetWineAppleCpuArea();
+}
+
 extern "C" uintptr_t FEXWineAppleCompileOneInsn(void* Frame, uint64_t GuestRIP);
 extern "C" void FEXWineAppleEnsure();
 
@@ -437,7 +443,7 @@ extern "C" uint64_t WineAppleEpLooksX64(uint64_t Ep) {
     return 0;
   }
   const uint8_t B = *reinterpret_cast<const volatile uint8_t*>(Ep);
-  if (B == 0x90 || B == 0x66 || B == 0x48 || B == 0xe8 || B == 0xe9) {
+  if (B == 0x90 || B == 0x66 || B == 0x48 || B == 0xe8 || B == 0xe9 || B == 0x8b || B == 0x89) {
     return 1;
   }
   if (B >= 0x40 && B <= 0x4f) {
@@ -453,10 +459,8 @@ extern "C" uint64_t WineAppleEpLooksX64(uint64_t Ep) {
 // jul9e: TEB->ChpeV2CpuAreaInfo->EmulatorData[0..2] were NULL at P8 after ThreadInit.
 // Module.S: PE-resident EnterEC (Darwin W^X-safe).
 extern "C" void WineAppleEnterEC();
-// Gate lb: real FillSRA (LoopTop+CompileBlock). EnterEC dispatcher is ret-only
-// on wine-apple (Dispatcher.cpp); FillSRA is the RX-safe JIT entry.
-extern "C" uint64_t WineAppleRealFillSRA;
-uint64_t WineAppleRealFillSRA = 0;
+// FillSRA lives in CPUArea.EmulatorData[3] — PE .data shares a 16K host page
+// with .rdata (RX), so a file-scope WineAppleRealFillSRA store is c0000005.
 
 extern "C" void FEXSyncTebX18ForEnter() {
   // TEB only — no GetCurrentThreadId/Threads (hybrid fault). Prefer Resolve, then slab.
@@ -1241,25 +1245,78 @@ static void FinishWineAppleProcessInit() {
 
 // Persist the current JIT GPR state into ContextAmd64 before leaving simulation.
 extern "C" void StoreJitStateToContextAmd64() {
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: enter\n");
+#endif
   FEXSyncTebX18();
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: after SyncTeb\n");
+#endif
 #if !FEX_ON_WINE_APPLE
   ProcessPendingCrossProcessEmulatorWork();
 #endif
   const auto CPUArea = GetCPUArea();
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: after GetCPUArea\n");
+#endif
   auto* Thread = CPUArea.ThreadState();
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: after ThreadState\n");
+#endif
   FEXCore::Core::CpuStateFrame* Frame = Thread ? Thread->CurrentFrame : CPUArea.StateFrame();
   if (!Frame || !CPUArea.Area || !CPUArea.Area->ContextAmd64) {
+#if FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("SJ: early return\n");
+#endif
     return;
   }
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: after Frame\n");
+#endif
 
   auto& State = Frame->State;
   auto& Ctx = CPUArea.ContextAmd64().AMD64_Context;
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: after Ctx\n");
+#endif
   Ctx.ContextFlags |= CONTEXT_INTEGER | CONTEXT_CONTROL;
   Ctx.Rax = State.gregs[FEXCore::X86State::REG_RAX];
   Ctx.Rcx = State.gregs[FEXCore::X86State::REG_RCX];
   Ctx.Rdx = State.gregs[FEXCore::X86State::REG_RDX];
   Ctx.Rbx = State.gregs[FEXCore::X86State::REG_RBX];
   Ctx.Rsp = State.gregs[FEXCore::X86State::REG_RSP];
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: after integer/RSP\n");
+  // s46: CALL return is GuestRIP+len stashed at CompileBlock. Do not peek [RSP]
+  // (shadow space looked like 0x1400013e3 → 5th _initialize).
+  // s130 leave callret after StoreJit so s125 LoopTop can reload if FillSRA/native zeros RIP. s46 zero blocked that. Do not LoadConstant in LoopTop.
+  const uint64_t Stash = State.WineAppleCallRet;
+  if (Stash >= 0x140000000ull && Stash < 0x140100000ull) {
+    State.rip = Stash;
+    FEXCore::Allocator::CtorLog("SJ: rip from callret\n");
+    {
+      char Line[48];
+      size_t I = 0;
+      const char* Pfx = "s130 crt=";
+      while (Pfx[I]) {
+        Line[I] = Pfx[I];
+        ++I;
+      }
+      for (int B = 15; B >= 0; --B) {
+        const unsigned N = static_cast<unsigned>((Stash >> (B * 4)) & 0xf);
+        Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+      }
+      Line[I++] = '\n';
+      Line[I] = 0;
+      FEXCore::Allocator::CtorLog(Line);
+    }
+    if (Ctx.Rsp >= 8) {
+      Ctx.Rsp += 8;
+      State.gregs[FEXCore::X86State::REG_RSP] = Ctx.Rsp;
+    }
+  }
+  FEXCore::Allocator::CtorLog("SJ: after RSP+8\n");
+#endif
   Ctx.Rbp = State.gregs[FEXCore::X86State::REG_RBP];
   Ctx.Rsi = State.gregs[FEXCore::X86State::REG_RSI];
   Ctx.Rdi = State.gregs[FEXCore::X86State::REG_RDI];
@@ -1272,6 +1329,9 @@ extern "C" void StoreJitStateToContextAmd64() {
   Ctx.R14 = State.gregs[FEXCore::X86State::REG_R14];
   Ctx.R15 = State.gregs[FEXCore::X86State::REG_R15];
   Ctx.Rip = State.rip;
+#if FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("SJ: done\n");
+#endif
 }
 
 // Marshal x64 JIT GPR state into ARM64EC CPU registers before calling an entry thunk.
@@ -1342,6 +1402,7 @@ extern "C" void ApplyJitStateToCpuForEcEntry() {
     return;
   }
 
+  const uint64_t GuestRsp = sp;
   if (!sp) {
     __asm__ volatile( "mov %0, sp" : "=r"( sp ) );
   }
@@ -1349,6 +1410,16 @@ extern "C" void ApplyJitStateToCpuForEcEntry() {
 #if FEX_ON_WINE_APPLE
   // Do not write x19–x29: those are C callee-saved / FP. Setting x29 here
   // made the epilogue pop [guest RBP] and br to CHPE Area+0x50 (hn4).
+  // s105: ARM64EC 5th/6th args are x4/x5 from Frame RSP (post-CALL-push).
+  // s104 [x23] was stale. Do not write x23. Do not svc.
+  // s109: S[4]/S[5] = [Rsp+0x20]/[+0x28] IAT/Flags (match Module.S; 5th=IAT).
+  uint64_t Arg5 = 0;
+  uint64_t Arg6 = 0;
+  if (GuestRsp >= 0x10000ull && (GuestRsp & 7ull) == 0) {
+    const volatile uint64_t* S = reinterpret_cast<const volatile uint64_t*>(GuestRsp);
+    Arg5 = S[4];
+    Arg6 = S[5];
+  }
   (void)sp;
   (void)fp;
   (void)x5;
@@ -1363,10 +1434,12 @@ extern "C" void ApplyJitStateToCpuForEcEntry() {
                    "mov x1, %1\n\t"
                    "mov x2, %2\n\t"
                    "mov x3, %3\n\t"
-                   "mov x8, %4\n"
+                   "mov x4, %4\n\t"
+                   "mov x5, %5\n\t"
+                   "mov x8, %6\n"
                    :
-                   : "r"(x0), "r"(x1), "r"(x2), "r"(x3), "r"(x8)
-                   : "x0", "x1", "x2", "x3", "x8");
+                   : "r"(x0), "r"(x1), "r"(x2), "r"(x3), "r"(Arg5), "r"(Arg6), "r"(x8)
+                   : "x0", "x1", "x2", "x3", "x4", "x5", "x8");
 #else
   __asm__ volatile("mov x0, %0\n\t"
                    "mov x1, %1\n\t"
@@ -2035,25 +2108,26 @@ NTSTATUS ThreadInit() {
 #else
   FEX::Windows::CallRetStack::InitializeThread(Thread);
 #endif
+  TiLog("FEX ThreadInit: before ExitFunctionEC ptr\n");
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
   CPUArea.StateFrame() = Thread->CurrentFrame;
+  TiLog("FEX ThreadInit: after StateFrame\n");
 
   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
   CPUArea.DispatcherLoopTopEnterEC() = EnterEC;
 
   uint64_t EnterECFillSRA = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterECFillSRA;
   CPUArea.DispatcherLoopTopEnterECFillSRA() = EnterECFillSRA;
+  TiLog("FEX ThreadInit: FillSRA in CPUArea[3]\n");
 
 #if FEX_ON_WINE_APPLE
   // Gate lb: AbsoluteLoopTopEnterEC is ret-only on wine-apple; FillSRA still
   // enters LoopTop+CompileBlock (RX dispatcher code). Publish FillSRA for
-  // WineAppleEnterEC; keep PE-text EnterEC stub on [2]. BeginSim bare-br unchanged.
+  // WineAppleEnterEC via CPUArea[3] (not PE .data). Keep PE-text EnterEC stub on [2].
   {
-    WineAppleRealFillSRA = EnterECFillSRA;
     const uint64_t Stub = reinterpret_cast<uint64_t>(&WineAppleEnterEC);
     CPUArea.DispatcherLoopTopEnterEC() = Stub;
     Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC = Stub;
-    /* EmulatorData[3] remains real FillSRA (set above). */
     TiLog("FEX ThreadInit: WineAppleEnterEC→FillSRA LoopTop (lb)\n");
   }
   // jul10ah: field-by-field ContextAmd64 + light LoadState (no aggregate brace-init /

@@ -624,14 +624,29 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP}
   , CTX {ctx}
   , TempAllocator(ctx->CPUBackendAllocator, 0) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("Arm64JITCore: body enter\n");
+#endif
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  // GetPass<T>("RA") is fextl::string-by-value + dynamic_cast — c000001d before JIT.
+  RAPass = static_cast<IR::RegisterAllocationPass*>(Thread->PassManager->GetRAPass());
+  FEXCore::Allocator::CtorLog("Arm64JITCore: after GetRAPass\n");
+#else
   RAPass = Thread->PassManager->GetPass<IR::RegisterAllocationPass>("RA");
+#endif
 
   RAPass->AddRegisters(IR::RegClass::GPR, GeneralRegisters.size());
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("Arm64JITCore: after AddRegisters GPR\n");
+#endif
   RAPass->AddRegisters(IR::RegClass::GPRFixed, StaticRegisters.size());
   RAPass->AddRegisters(IR::RegClass::FPR, GeneralFPRegisters.size());
   RAPass->AddRegisters(IR::RegClass::FPRFixed, StaticFPRegisters.size());
   RAPass->PairRegs = PairRegisters;
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("Arm64JITCore: after AddRegisters all\n");
+#endif
 
   {
     // Set up pointers that the JIT needs to load
@@ -651,6 +666,9 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
       FEXCore::Utils::MemberFunctionToPointerCast PMF(&FEXCore::CPUIDEmu::RunFunction);
       Ptrs.CPUIDFunction = PMF.GetConvertedPointer();
     }
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("Arm64JITCore: after CPUID PMF\n");
+#endif
 
     {
       FEXCore::Utils::MemberFunctionToPointerCast PMF(&FEXCore::CPUIDEmu::RunXCRFunction);
@@ -662,13 +680,25 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
       Ptrs.SyscallHandlerObj = reinterpret_cast<uint64_t>(CTX->SyscallHandler);
       Ptrs.SyscallHandlerFunc = PMF.GetVTableEntry(CTX->SyscallHandler);
     }
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+    FEXCore::Allocator::CtorLog("Arm64JITCore: after syscall PMF\n");
+#endif
     Ptrs.ExitFunctionLink = reinterpret_cast<uintptr_t>(&Arm64JITCore::ExitFunctionLink);
     Ptrs.LUDIV = reinterpret_cast<uint64_t>(LUDIV);
     Ptrs.LDIV = reinterpret_cast<uint64_t>(LDIV);
   }
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("Arm64JITCore: before GetLatest\n");
+#endif
   CurrentCodeBuffer = CodeBuffers.GetLatest();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("Arm64JITCore: after GetLatest\n");
+#endif
   ThreadState->LookupCache->Shared = CurrentCodeBuffer->LookupCache.get();
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("Arm64JITCore: done\n");
+#endif
 }
 
 void Arm64JITCore::EmitDetectionString() {
@@ -816,8 +846,214 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
   EmitSuspendInterruptCheck();
 }
 
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+static void WineAppleLogHex64(const char* Prefix, uint64_t V);
+#endif
+
 CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("JIT CC enter\n");
+  if (!IR) {
+    FEXCore::Allocator::CtorLog("JIT CC no IR\n");
+    return {};
+  }
+  this->Entry = Entry;
+  this->IR = IR;
+  this->DebugData = DebugData;
+  RequiresFarARM64Jumps = false;
+  PendingTargetLabel = nullptr;
+  PendingCallReturnTargetLabel = nullptr;
+  SpillSlots = IR->SpillSlots();
+
+  auto* Buf = CurrentCodeBuffer.get();
+  if (!Buf || !Buf->Ptr) {
+    FEXCore::Allocator::CtorLog("JIT CC no buffer\n");
+    return {};
+  }
+  (void)FEXCore::Allocator::VirtualProtect(Buf->Ptr, Buf->UsableSize(),
+                                           FEXCore::Allocator::ProtectOptions::Read | FEXCore::Allocator::ProtectOptions::Write);
+  SetBuffer(Buf->Ptr, Buf->UsableSize());
+  uint64_t Off = CodeBuffers.LatestOffset;
+  if (Off & 15) {
+    Off = (Off + 15) & ~15ull;
+  }
+  SetCursorOffset(Off);
+  CodeData.BlockBegin = GetCursorAddress<uint8_t*>();
+  uint8_t* FirstEntry = nullptr;
+
+  FEXCore::Allocator::CtorLog("JIT CC emit\n");
+  // Hangover: size JumpTargets to BlockCount and emit every IR block.
+  // Skipping Id>=8 dropped ExitFunction in high-ID blocks (13fc hang).
+  JumpTargets.clear();
+  JumpTargets.resize(IR->GetHeader()->BlockCount, {});
+  uint32_t ExitFnCount = 0;
+  uint32_t UnhCount = 0;
+  char OpLine[80];
+  size_t OpOff = 0;
+  if (Entry == 0x1400013fcull) {
+    OpLine[OpOff++] = '1';
+    OpLine[OpOff++] = '3';
+    OpLine[OpOff++] = 'f';
+    OpLine[OpOff++] = 'c';
+    OpLine[OpOff++] = ' ';
+    OpLine[OpOff++] = 'o';
+    OpLine[OpOff++] = 'p';
+    OpLine[OpOff++] = 's';
+    OpLine[OpOff++] = ':';
+  }
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+    const uint32_t Id = BlockIROp->ID;
+    auto* Target = &JumpTargets[Id];
+    if (PendingTargetLabel && PendingTargetLabel != Target) {
+      b(PendingTargetLabel);
+      PendingTargetLabel = nullptr;
+    }
+    bool EmitRunCrumb = false;
+    if (BlockIROp->EntryPoint && !FirstEntry) {
+      FirstEntry = GetCursorAddress<uint8_t*>();
+      EmitRunCrumb = (Entry == 0x1400013fcull);
+    }
+    PendingTargetLabel = nullptr;
+    (void)Bind(Target);
+    if (EmitRunCrumb) {
+      EmitWineAppleCtorLog("JIT: 13fc run\n");
+    }
+
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      if (Entry == 0x1400013fcull && OpOff + 4 < sizeof(OpLine) - 2) {
+        const auto OpN = static_cast<uint32_t>(IROp->Op) & 0xff;
+        OpLine[OpOff++] = ' ';
+        const unsigned Hi = (OpN >> 4) & 0xf;
+        const unsigned Lo = OpN & 0xf;
+        OpLine[OpOff++] = Hi < 10 ? static_cast<char>('0' + Hi) : static_cast<char>('a' + (Hi - 10));
+        OpLine[OpOff++] = Lo < 10 ? static_cast<char>('0' + Lo) : static_cast<char>('a' + (Lo - 10));
+      }
+      if (IROp->Op == FEXCore::IR::IROps::OP_EXITFUNCTION) {
+        ++ExitFnCount;
+      }
+      if (Entry == 0x14000101aull) {
+        if (IROp->Op == FEXCore::IR::IROps::OP_ENTRYPOINTOFFSET) {
+          auto* E = IROp->C<FEXCore::IR::IROp_EntrypointOffset>();
+          WineAppleLogHex64("s77 eoff=", Entry + static_cast<uint64_t>(E->Offset));
+        } else if (IROp->Op == FEXCore::IR::IROps::OP_PUSH) {
+          auto* P = IROp->C<FEXCore::IR::IROp_Push>();
+          uint64_t V = 0;
+          if (IsInlineEntrypointOffset(P->Value, &V) || IsInlineConstant(P->Value, &V)) {
+            WineAppleLogHex64("s77 pimm=", V);
+          } else {
+            FEXCore::Allocator::CtorLog("s77 pssa\n");
+            auto* H = IR->GetOp<FEXCore::IR::IROp_Header>(P->Value);
+            WineAppleLogHex64("s77 pop=", static_cast<uint64_t>(H->Op));
+            if (H->Op == FEXCore::IR::IROps::OP_ENTRYPOINTOFFSET) {
+              auto* E = H->C<FEXCore::IR::IROp_EntrypointOffset>();
+              WineAppleLogHex64("s77 pval=", Entry + static_cast<uint64_t>(E->Offset));
+            }
+          }
+        }
+      }
+      switch (IROp->Op) {
+#define REGISTER_OP(op, x) \
+  case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
+
+#define IROP_DISPATCH_DISPATCH
+#include <FEXCore/IR/IRDefines_Dispatch.inc>
+#undef REGISTER_OP
+
+      default:
+        ++UnhCount;
+        Op_Unhandled(IROp, CodeNode);
+        break;
+      }
+    }
+  }
+  if (PendingTargetLabel) {
+    b(PendingTargetLabel);
+    PendingTargetLabel = nullptr;
+  }
+
+  CodeData.Size = GetCursorAddress<uint8_t*>() - CodeData.BlockBegin;
+  CodeBuffers.LatestOffset = GetCursorOffset();
+  uint8_t* Exec = FirstEntry ? FirstEntry : CodeData.BlockBegin;
+  if (Entry == 0x14000101aull) {
+    WineAppleLogHex64("s78 spill=", SpillSlots);
+    WineAppleLogHex64("s78 hsz=", CodeData.Size);
+    {
+      char Line[80];
+      size_t O = 0;
+      const char* Pfx = "s78 h:";
+      while (Pfx[O]) {
+        Line[O] = Pfx[O];
+        ++O;
+      }
+      const size_t Words = CodeData.Size / 4;
+      const auto* W = reinterpret_cast<const uint32_t*>(Exec);
+      for (size_t I = 0; I < Words && I < 8 && O + 9 < sizeof(Line) - 2; ++I) {
+        Line[O++] = ' ';
+        const uint32_t V = W[I];
+        for (int B = 7; B >= 0; --B) {
+          const unsigned N = (V >> (B * 4)) & 0xf;
+          Line[O++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+        }
+      }
+      Line[O++] = '\n';
+      Line[O] = 0;
+      FEXCore::Allocator::CtorLog(Line);
+    }
+  }
+  if (Entry == 0x1400013fcull) {
+    WineAppleLogHex64("13fc bc=", IR->GetHeader()->BlockCount);
+    WineAppleLogHex64("13fc spill=", SpillSlots);
+    WineAppleLogHex64("13fc ex=", ExitFnCount);
+    WineAppleLogHex64("13fc unh=", UnhCount);
+    WineAppleLogHex64("13fc hsz=", CodeData.Size);
+    WineAppleLogHex64("13fc exec=", reinterpret_cast<uint64_t>(Exec));
+    if (OpOff > 0 && OpOff < sizeof(OpLine) - 1) {
+      OpLine[OpOff++] = '\n';
+      OpLine[OpOff] = 0;
+      FEXCore::Allocator::CtorLog(OpLine);
+    }
+    {
+      char Line[80];
+      size_t O = 0;
+      Line[O++] = '1';
+      Line[O++] = '3';
+      Line[O++] = 'f';
+      Line[O++] = 'c';
+      Line[O++] = ' ';
+      Line[O++] = 'h';
+      Line[O++] = ':';
+      const size_t Words = CodeData.Size / 4;
+      const auto* W = reinterpret_cast<const uint32_t*>(Exec);
+      for (size_t I = 0; I < Words && I < 8 && O + 9 < sizeof(Line) - 2; ++I) {
+        Line[O++] = ' ';
+        const uint32_t V = W[I];
+        for (int B = 7; B >= 0; --B) {
+          const unsigned N = (V >> (B * 4)) & 0xf;
+          Line[O++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+        }
+      }
+      Line[O++] = '\n';
+      Line[O] = 0;
+      FEXCore::Allocator::CtorLog(Line);
+    }
+  }
+  ClearICache(Exec, CodeData.Size ? CodeData.Size : 64);
+  (void)FEXCore::Allocator::VirtualProtect(Buf->Ptr, Buf->UsableSize(),
+                                           FEXCore::Allocator::ProtectOptions::Read | FEXCore::Allocator::ProtectOptions::Exec);
+  ClearICache(Exec, CodeData.Size ? CodeData.Size : 64);
+  if (FirstEntry) {
+    CodeData.BlockBegin = FirstEntry;
+  }
+  FEXCore::Allocator::CtorLog("JIT CC done\n");
+  {
+    CPUBackend::CompiledCode Out {};
+    Out.BlockBegin = Exec;
+    Out.Size = CodeData.Size;
+    return Out;
+  }
+#else
   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
 
   const auto PrevNumAllocations = Relocations.size();
@@ -1169,7 +1405,50 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   this->IR = nullptr;
 
   return std::move(CodeData);
+#endif
 }
+
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+void Arm64JITCore::EmitWineAppleCtorLog(const char* Msg) {
+  size_t Len = 0;
+  const volatile char* P = Msg;
+  while (P[Len]) {
+    ++Len;
+  }
+  // Guest RSP is x23. ARM SP is the process stack. Preserve rcx/rdx/r8 SRA.
+  str<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, -48);
+  str(ARMEmitter::XReg::x1, ARMEmitter::Reg::rsp, 8);
+  str(ARMEmitter::XReg::x2, ARMEmitter::Reg::rsp, 16);
+  str(ARMEmitter::XReg::x16, ARMEmitter::Reg::rsp, 24);
+  str(ARMEmitter::XReg::x18, ARMEmitter::Reg::rsp, 32);
+  LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 2);
+  LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, reinterpret_cast<uint64_t>(Msg));
+  LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, Len);
+  LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r16, 4);
+  svc(0x80);
+  ldr(ARMEmitter::XReg::x18, ARMEmitter::Reg::rsp, 32);
+  ldr(ARMEmitter::XReg::x16, ARMEmitter::Reg::rsp, 24);
+  ldr(ARMEmitter::XReg::x2, ARMEmitter::Reg::rsp, 16);
+  ldr(ARMEmitter::XReg::x1, ARMEmitter::Reg::rsp, 8);
+  ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, 48);
+}
+
+static void WineAppleLogHex64(const char* Prefix, uint64_t V) {
+  char Line[48];
+  size_t I = 0;
+  while (Prefix[I] && I < 24) {
+    Line[I] = Prefix[I];
+    ++I;
+  }
+  for (int B = 15; B >= 0; --B) {
+    const unsigned N = static_cast<unsigned>((V >> (B * 4)) & 0xf);
+    Line[I++] = N < 10 ? static_cast<char>('0' + N) : static_cast<char>('a' + (N - 10));
+  }
+  Line[I++] = '\n';
+  Line[I] = 0;
+  FEXCore::Allocator::CtorLog(Line);
+}
+#endif
 
 void Arm64JITCore::ResetStack() {
   if (SpillSlots == 0) {
@@ -1188,7 +1467,20 @@ void Arm64JITCore::ResetStack() {
 }
 
 fextl::unique_ptr<CPUBackend> CreateArm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::InternalThreadState* Thread) {
+#if defined(FEX_ON_WINE_APPLE) && FEX_ON_WINE_APPLE
+  FEXCore::Allocator::CtorLog("CreateArm64JITCore: enter\n");
+  auto ptr = FEXCore::Allocator::aligned_alloc(alignof(Arm64JITCore), sizeof(Arm64JITCore));
+  if (!ptr) {
+    FEXCore::Allocator::CtorLog("CreateArm64JITCore: alloc FAIL\n");
+    return {};
+  }
+  FEXCore::Allocator::CtorLog("CreateArm64JITCore: after alloc, placement new\n");
+  auto* Result = ::new (ptr) Arm64JITCore(ctx, Thread);
+  FEXCore::Allocator::CtorLog("CreateArm64JITCore: after placement new\n");
+  return fextl::unique_ptr<CPUBackend>(Result);
+#else
   return fextl::make_unique<Arm64JITCore>(ctx, Thread);
+#endif
 }
 
 } // namespace FEXCore::CPU
